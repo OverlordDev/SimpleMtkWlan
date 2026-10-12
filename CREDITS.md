@@ -39,3 +39,8 @@ files.
 The top-level project is distributed under GPLv2. Individual files may include
 more specific GPL, BSD, OpenBSD, NetBSD, FreeBSD, or permissive license notices;
 those notices remain authoritative for the corresponding files.
+
+## macOS Sequoia fork additions
+
+Sequoia port (firmware-chunk allocation, HT/VHT BSS parameters, TX A-MPDU originator, BSS RLM, clang-only build scripts) and the
+experimental IO80211 Sequoia ABI tooling were added in this fork; see `SEQUOIA.md`. All changes remain under GPL-2.0.

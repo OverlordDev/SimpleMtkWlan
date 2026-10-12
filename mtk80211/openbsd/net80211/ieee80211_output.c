@@ -541,6 +541,7 @@ ieee80211_tx_compressed_bar(struct ieee80211com *ic, struct ieee80211_node *ni,
  *     The convention is ic_bss is not reference counted; the caller must
  *     maintain that.
  */
+extern int mtk_eapol_qos_tid;
 mbuf_t
 ieee80211_encap(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node **pni)
 {
@@ -655,6 +656,16 @@ fallback:
     } else {
         hdrlen = sizeof(struct ieee80211_frame);
         addqos = 0;
+    }
+    /*
+     * Some APs (seen: Altibox 5 GHz) silently drop non-QoS data frames,
+     * including EAPOL msg2, from this STA. Send all STA data as QoS data
+     * like mac80211 does: EAPOL on TID 7, everything else on TID 0.
+     */
+    if (ic->ic_opmode == IEEE80211_M_STA) {
+        hdrlen = sizeof(struct ieee80211_qosframe);
+        addqos = 1;
+        tid = (eh.ether_type == htons(ETHERTYPE_PAE)) ? 7 : 0;
     }
     mbuf_adj(m, sizeof(struct ether_header) - LLC_SNAPFRAMELEN);
     llc = mtod(m, struct llc *);
@@ -1557,6 +1568,14 @@ ieee80211_get_deauth(struct ieee80211com *ic, struct ieee80211_node *ni,
  * [tlv] QoS Capability (802.11e)
  * [tlv] HT Capabilities (802.11n)
  */
+/*
+ * DEBUG experiment: cycle assoc/EAPOL variants for the Altibox AP on every
+ * attempt. bit0: Privacy in capinfo, bit1: WMM info IE, bit2: delay msg2.
+ */
+int mtk_variant_cur;
+int mtk_eapol_qos_tid = -1;
+static int mtk_variant_n;
+
 mbuf_t
 ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
     int type)
@@ -1565,6 +1584,10 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 	mbuf_t m;
 	u_int8_t *frm;
 	u_int16_t capinfo;
+	int variant = 0;
+
+	mtk_variant_cur = 0;
+	(void)mtk_variant_n;
 
 	m = ieee80211_getmgmt(MBUF_DONTWAIT, MT_DATA,
 	    2 + 2 +
@@ -1581,6 +1604,7 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 	    (((ic->ic_flags & IEEE80211_F_RSNON) &&
 	      (ni->ni_rsnprotos & IEEE80211_PROTO_WPA)) ?
 		2 + IEEE80211_WPAIE_MAXLEN : 0) +
+	    sizeof(struct ieee80211_wme_info) +
 	    ((ic->ic_flags & IEEE80211_F_HTON) ? sizeof(struct ieee80211_ie_htcap) + sizeof(struct ieee80211_wme_info) : 0) +
         ((ic->ic_flags & IEEE80211_F_VHTON) ? sizeof(struct ieee80211_ie_vhtcap) + 2 : 0) +
         ((ic->ic_flags & IEEE80211_F_HEON) ? (sizeof(struct ieee80211_he_cap_elem) + 2 + 1 + sizeof(struct ieee80211_he_mcs_nss_supp) + IEEE80211_HE_PPE_THRES_MAX_LEN) : 0));
@@ -1596,6 +1620,8 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		capinfo |= IEEE80211_CAPINFO_SHORT_PREAMBLE;
 	if (ic->ic_caps & IEEE80211_C_SHSLOT)
 		capinfo |= IEEE80211_CAPINFO_SHORT_SLOTTIME;
+	if (variant & 1)
+		capinfo |= IEEE80211_CAPINFO_PRIVACY;
 	LE_WRITE_2(frm, capinfo); frm += 2;
 	LE_WRITE_2(frm, ic->ic_lintval); frm += 2;
 	if (type == IEEE80211_FC0_SUBTYPE_REASSOC_REQ) {
@@ -1640,6 +1666,9 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
     
     if (ic->ic_flags & IEEE80211_F_HEON)
         frm = ieee80211_add_hecaps(frm, ic);
+
+    if ((variant & 2) && !(ic->ic_flags & IEEE80211_F_HTON))
+        frm = ieee80211_add_wme_info(frm, ic);
 
     size_t l = frm - mtod(m, u_int8_t *);
     mbuf_pkthdr_setlen(m, l);

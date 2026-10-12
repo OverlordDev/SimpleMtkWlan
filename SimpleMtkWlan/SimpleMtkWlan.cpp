@@ -28,6 +28,7 @@
 #include <IOKit/network/IONetworkMedium.h>
 #include <net/ethernet.h>
 #include <crypto/sha1.h>
+#include <crypto/hmac.h>
 #include <net80211/ieee80211_node.h>
 #include <net80211/ieee80211_ioctl.h>
 
@@ -166,8 +167,11 @@ bool SimpleMtkWlan::createMediumTables(const IONetworkMedium **primary)
     return result;
 }
 
+char mtk_dbg_pass[65];
+
 void SimpleMtkWlan::joinSSID(const char *ssid_name, const char *ssid_pwd)
 {
+    strlcpy(mtk_dbg_pass, ssid_pwd, sizeof(mtk_dbg_pass));
     struct ieee80211com *ic = fHalService->get80211Controller();
     
     if (strlen(ssid_pwd) == 0) {
@@ -207,6 +211,7 @@ void SimpleMtkWlan::joinSSID(const char *ssid_name, const char *ssid_pwd)
 
 void SimpleMtkWlan::associateSSID(const char *ssid, const char *pwd)
 {
+    strlcpy(mtk_dbg_pass, pwd, sizeof(mtk_dbg_pass));
     struct ieee80211com *ic = fHalService->get80211Controller();
     if (strlen(pwd) == 0) {
         memcpy(nwid.i_nwid, ssid, 32);
@@ -289,11 +294,43 @@ void SimpleMtkWlan::associateSSID(const char *ssid, const char *pwd)
     }
 }
 
+void ieee80211_prf(const u_int8_t *, size_t, const u_int8_t *, size_t,
+    const u_int8_t *, size_t, u_int8_t *, size_t);
+extern "C" void mtk_ringlog_start(IOService *svc);
+extern "C" void mtk_ringlog_stop(void);
+
 bool SimpleMtkWlan::start(IOService *provider)
 {
     int boot_value = 0;
     if (!super::start(provider)) {
         return false;
+    }
+    mtk_ringlog_start(this);
+    {
+        /* crypto self-test: IEEE 802.11i H.4 vector ("password"/"IEEE") and RFC2202 HMAC-SHA1 case 2 */
+        u8 pmk[32];
+        pbkdf2_sha1("password", (const u8 *)"IEEE", 4, 4096, pmk, 32);
+        XYLog("SELFTEST pbkdf2 %02x%02x%02x%02x..%02x%02x (want f42c6fc5..a12e)\n",
+              pmk[0], pmk[1], pmk[2], pmk[3], pmk[30], pmk[31]);
+        u8 mac[20];
+        hmac_sha1((const u8 *)"Jefe", 4, (const u8 *)"what do ya want for nothing?", 28, mac);
+        XYLog("SELFTEST hmac_sha1 %02x%02x%02x%02x (want effcdf6a)\n", mac[0], mac[1], mac[2], mac[3]);
+        {
+            u8 key[32], ctx[76], out[48], data[121], dg[20];
+            static const u8 label[23] = "Pairwise key expansion";
+            for (int i = 0; i < 32; i++) key[i] = i;
+            for (int i = 0; i < 76; i++) ctx[i] = (i * 7 + 3) & 0xff;
+            ieee80211_prf(key, 32, label, 23, ctx, 76, out, 48);
+            XYLog("SELFTEST prf %02x%02x%02x%02x..%02x%02x%02x%02x (want 4961f7f5..fa45c-> ..52fa45c ends 2fa45c)\n",
+                  out[0], out[1], out[2], out[3], out[44], out[45], out[46], out[47]);
+            for (int i = 0; i < 121; i++) data[i] = (i * 5 + 1) & 0xff;
+            HMAC_SHA1_CTX hc;
+            HMAC_SHA1_Init(&hc, key, 16);
+            HMAC_SHA1_Update(&hc, data, 121);
+            HMAC_SHA1_Final(dg, &hc);
+            XYLog("SELFTEST hmac_stream121 %02x%02x%02x%02x%02x%02x%02x%02x (want 16cccc0cb45d90eb)\n",
+                  dg[0], dg[1], dg[2], dg[3], dg[4], dg[5], dg[6], dg[7]);
+        }
     }
     pciNub = OSDynamicCast(IOPCIDevice, provider);
     if (!pciNub) {
@@ -509,6 +546,7 @@ void SimpleMtkWlan::free()
         fHalService->release();
         fHalService = NULL;
     }
+    mtk_ringlog_stop();
     super::free();
 }
 

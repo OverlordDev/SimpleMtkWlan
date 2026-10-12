@@ -43,6 +43,7 @@
  * IEEE Std 802.11-2007 section 8.5.
  */
 
+#include <crypto/sha1.h>
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/mbuf.h>
@@ -203,6 +204,40 @@ done:
     mbuf_freem(m);
 }
 
+extern int mtk_variant_cur;
+extern char mtk_dbg_pass[65];
+
+/* DEBUG: PMK/AA candidates tried on successive msg1 retransmissions */
+static const u_int8_t mtk_alt_aa[6] = { 0x1e, 0x74, 0x0d, 0x0c, 0xcd, 0xc0 };
+static int mtk_aa_alt_on;
+int mtk_msg2_bits;
+int mtk_msg2_active;
+
+static const u_int8_t *
+mtk_aa(const struct ieee80211_node *ni)
+{
+    return mtk_aa_alt_on ? mtk_alt_aa : ni->ni_macaddr;
+}
+
+/* hex dump into the ring log in <=96-byte chunks: "DIAGHEX tag off: hex" */
+void
+mtk_diag_hex(const char *tag, const u_int8_t *p, int len)
+{
+    static const char hx[] = "0123456789abcdef";
+    char buf[2 * 96 + 1];
+    int off, n, i;
+
+    for (off = 0; off < len; off += 96) {
+        n = len - off < 96 ? len - off : 96;
+        for (i = 0; i < n; i++) {
+            buf[2 * i] = hx[p[off + i] >> 4];
+            buf[2 * i + 1] = hx[p[off + i] & 15];
+        }
+        buf[2 * n] = 0;
+        XYLog("DIAGHEX %s %d: %s\n", tag, off, buf);
+    }
+}
+
 /*
  * Process Message 1 of the 4-Way Handshake (sent by Authenticator).
  */
@@ -276,6 +311,9 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
     } else    /* use pre-shared key */
         memcpy(ni->ni_pmk, ic->ic_psk, IEEE80211_PMK_LEN);
     ni->ni_flags |= IEEE80211_NODE_PMK;
+
+    mtk_aa_alt_on = 0;
+    mtk_msg2_bits = 0;
     
     /* save authenticator's nonce (ANonce) */
     memcpy(ni->ni_nonce, key->nonce, EAPOL_KEY_NONCE_LEN);
@@ -284,19 +322,42 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
     arc4random_buf(ic->ic_nonce, EAPOL_KEY_NONCE_LEN);
     
     /* TPTK = CalcPTK(PMK, ANonce, SNonce) */
-    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, ni->ni_macaddr,
+    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, mtk_aa(ni),
                          ic->ic_myaddr, ni->ni_nonce, ic->ic_nonce, &tptk);
     
     /* We are now expecting a new pairwise key. */
     ni->ni_flags |= IEEE80211_NODE_RSN_NEW_PTK;
     
+    XYLog("DIAG msg1: info=%04x akm=%d proto=%d cipher=%d gcipher=%d replay=%llu ok=%d psk=%02x%02x%02x%02x pmk=%02x%02x%02x%02x kck=%02x%02x%02x%02x anonce=%02x%02x snonce=%02x%02x sha256=%d aa=%s spa=%s\n",
+          BE_READ_2(key->info), ni->ni_rsnakms, ni->ni_rsnprotos, ni->ni_rsncipher, ni->ni_rsngroupcipher,
+          (unsigned long long)BE_READ_8(key->replaycnt), ni->ni_replaycnt_ok,
+          ic->ic_psk[0], ic->ic_psk[1], ic->ic_psk[2], ic->ic_psk[3],
+          ni->ni_pmk[0], ni->ni_pmk[1], ni->ni_pmk[2], ni->ni_pmk[3],
+          tptk.kck[0], tptk.kck[1], tptk.kck[2], tptk.kck[3],
+          ni->ni_nonce[0], ni->ni_nonce[1], ic->ic_nonce[0], ic->ic_nonce[1],
+          ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms),
+          "-", "-");
+    XYLog("DIAG rsn: supported_akms=0x%x akms=0x%x ciphers=0x%x caps=0x%04x ie_tlv_len=%u\n",
+          ni->ni_supported_rsnakms, ni->ni_rsnakms, ni->ni_rsnciphers, ni->ni_rsncaps, ni->ni_rsnie_tlv_len);
+    if (ni->ni_rsnie_tlv) {
+        static int aprsn_n;
+        if (aprsn_n++ < 2)
+            mtk_diag_hex("APRSNIE", ni->ni_rsnie_tlv, ni->ni_rsnie_tlv_len > 300 ? 300 : ni->ni_rsnie_tlv_len);
+    }
+    mtk_diag_hex("AA", ni->ni_macaddr, 6);
+    mtk_diag_hex("SPA", ic->ic_myaddr, 6);
+    mtk_diag_hex("ANONCE", ni->ni_nonce, 32);
+    mtk_diag_hex("SNONCE", ic->ic_nonce, 32);
+    mtk_diag_hex("RXMSG1", (const u_int8_t *)key, 4 + BE_READ_2(key->len) + 0);
     if (ic->ic_if.if_flags & IFF_DEBUG)
         XYLog("%s: received msg %d/%d of the %s handshake from %s\n",
               ic->ic_if.if_xname, 1, 4, "4-way",
               ether_sprintf(ni->ni_macaddr));
     
     /* send message 2 to authenticator using TPTK */
+    mtk_msg2_active = 1;
     (void)ieee80211_send_4way_msg2(ic, ni, key->replaycnt, &tptk);
+    mtk_msg2_active = 0;
 }
 
 #ifndef IEEE80211_STA_ONLY
@@ -424,7 +485,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         return;
     }
     /* TPTK = CalcPTK(PMK, ANonce, SNonce) */
-    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, ni->ni_macaddr,
+    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, mtk_aa(ni),
                          ic->ic_myaddr, key->nonce, ic->ic_nonce, &tptk);
     
     info = BE_READ_2(key->info);

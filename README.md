@@ -8,6 +8,9 @@
 
 # SimpleMtkWlan
 
+> **Fork — macOS Sequoia 15.x build.** HT/VHT80, TX A-MPDU, ~300 / ~226 Mbit/s on MT7921, clang-only build and a
+> prebuilt kext in [Releases](../../releases). See **[SEQUOIA.md](SEQUOIA.md)**.
+
 SimpleMtkWlan is an experimental macOS kernel extension for MediaTek MT792x PCIe
 wireless adapters.
 

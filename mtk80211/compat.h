@@ -220,6 +220,7 @@ struct bus_dmamap {
 	mbuf_t				dm_mbuf;
 	bool				dm_bounce;
 	int				dm_nsegs;
+	int				dm_maxsegs;
 	bus_size_t			dm_maxsize;
 	bus_size_t			dm_mapsize;
 	bus_size_t			dm_bounce_size;

@@ -433,7 +433,7 @@ enum mt76_rxq_id {
 #define	MT_MAX_SCATTER		4	/* limit of MT_HW_TXP_MAX_BUF_NUM */
 #define	MT_MAX_SIZE		MT_DMA_CTL_SD_LEN_MASK
 
-#define	MWX_TXWI_MAX		512	/* HW limit is 8192 */
+#define	MWX_TXWI_MAX		2048	/* HW limit is 8192 */
 
 #define	MT_PACKET_ID_MASK		0x7f
 #define	MT_PACKET_ID_NO_ACK		0
@@ -1444,6 +1444,25 @@ struct wtbl_hdr_trans {
 	uint8_t		rsv;
 } __packed;
 
+#define	STA_REC_HT			0x09
+struct sta_rec_ht {
+	uint16_t	tag;
+	uint16_t	len;
+	uint16_t	ht_cap;
+	uint16_t	rsv;
+} __packed;
+
+#define	WTBL_HT				0x02
+struct wtbl_ht {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		ht;
+	uint8_t		ldpc;
+	uint8_t		af;
+	uint8_t		mm;
+	uint8_t		rsv[4];
+} __packed;
+
 #define	WTBL_SMPS			0x0d
 struct wtbl_smps {
 	uint16_t	tag;
@@ -1591,3 +1610,65 @@ enum mt76_phy_type {
 #define	rssi_to_rcpi(rssi)		(2 * (rssi) + 220)
 #define	rcpi_to_rssi(shift, rxv)	\
 	((((int)(((rxv) >> (shift)) & (MT_PRXV_RCPIX_MASK))) - 220) / 2)
+
+/* ---- Block Ack / VHT firmware records (layouts from the Linux mt76 driver) ---- */
+#define	STA_REC_BA			0x06
+struct sta_rec_ba {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		tid;
+	uint8_t		ba_type;
+	uint8_t		amsdu;
+	uint8_t		ba_en;
+	uint16_t	ssn;
+	uint16_t	winsize;
+} __packed;
+
+#define	STA_REC_VHT			0x0a
+struct sta_rec_vht {
+	uint16_t	tag;
+	uint16_t	len;
+	uint32_t	vht_cap;
+	uint16_t	vht_rx_mcs_map;
+	uint16_t	vht_tx_mcs_map;
+	uint8_t		rts_bw_sig;
+	uint8_t		rsv[3];
+} __packed;
+
+#define	WTBL_VHT			0x03
+struct wtbl_vht {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		ldpc;
+	uint8_t		dyn_bw;
+	uint8_t		vht;
+	uint8_t		txop_ps;
+	uint8_t		rsv[4];
+} __packed;
+
+#define	WTBL_BA				0x08
+struct wtbl_ba {
+	uint16_t	tag;
+	uint16_t	len;
+	/* common */
+	uint8_t		tid;
+	uint8_t		ba_type;
+	uint8_t		rsv0[2];
+	/* originator only */
+	uint16_t	sn;
+	uint8_t		ba_en;
+	uint8_t		ba_winsize_idx;
+	/* originator & recipient */
+	uint16_t	ba_winsize;
+	/* recipient only */
+	uint8_t		peer_addr[IEEE80211_ADDR_LEN];
+	uint8_t		rst_ba_tid;
+	uint8_t		rst_ba_sel;
+	uint8_t		rst_ba_sb;
+	uint8_t		band_idx;
+	uint8_t		rsv1[4];
+} __packed;
+
+#define	MT_BA_TYPE_ORIGINATOR		1
+#define	MT_BA_TYPE_RECIPIENT		2
+#define	RST_BA_MAC_TID_MATCH		0

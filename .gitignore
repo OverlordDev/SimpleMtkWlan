@@ -15,3 +15,10 @@ build/
 *.kext/
 *.zip
 *.tar.gz
+
+sequoia_build/out/
+sequoia_build/MacKernelSDK/
+sequoia_build/__pycache__/
+experimental/build/
+experimental/out/
+.DS_Store
