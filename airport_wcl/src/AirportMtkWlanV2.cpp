@@ -264,6 +264,7 @@ initCCLogs()
 }
 
 extern "C" void mtk_ringlog_start(IOService *svc);
+extern "C" void mtk_ringlog(const char *fmt, ...);
 
 bool AirportMtkWlan::start(IOService *provider)
 {
@@ -285,12 +286,14 @@ bool AirportMtkWlan::start(IOService *provider)
         return false;
     }
 #endif
+    mtk_ringlog("start: before super::start\n");
     if (!super::start(provider)) {
 #ifdef AIRPORT_WCL
         releaseAll();
 #endif
         return false;
     }
+    mtk_ringlog("start: super::start done\n");
     pciNub->setBusMasterEnable(true);
     pciNub->setIOEnable(true);
     pciNub->setMemoryEnable(true);
@@ -339,12 +342,14 @@ bool AirportMtkWlan::start(IOService *provider)
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
 #endif
 
+    mtk_ringlog("start: before hal attach\n");
     if (!fHalService->attach(pciNub)) {
         XYLog("attach fail\n");
         super::stop(pciNub);
         releaseAll();
         return false;
     }
+    mtk_ringlog("start: hal attach done\n");
     fWatchdogWorkLoop = IOWorkLoop::workLoop();
     if (fWatchdogWorkLoop == NULL) {
         XYLog("init watchdog workloop fail\n");
@@ -396,6 +401,7 @@ bool AirportMtkWlan::start(IOService *provider)
         return false;
     }
 #endif
+    mtk_ringlog("start: before fNetIf attach\n");
     if (!fNetIf->attach(this)) {
         XYLog("attach to service fail\n");
         super::stop(provider);
@@ -420,6 +426,7 @@ bool AirportMtkWlan::start(IOService *provider)
         releaseAll();
         return false;
     }
+    mtk_ringlog("start: attachInterface done\n");
     memset(&registInfo, 0, sizeof(registInfo));
     if (!fNetIf->initRegistrationInfo(&registInfo, 1, sizeof(registInfo))) {
         XYLog("initRegistrationInfo fail\n");
@@ -461,6 +468,7 @@ bool AirportMtkWlan::start(IOService *provider)
     fNetIf->start(this);
 
 #endif
+    mtk_ringlog("start: fNetIf start done\n");
     setLinkStatus(kIONetworkLinkValid);
     if (TAILQ_EMPTY(&fHalService->get80211Controller()->ic_ess))
         fHalService->get80211Controller()->ic_flags |= IEEE80211_F_AUTO_JOIN;

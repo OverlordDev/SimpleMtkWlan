@@ -12,3 +12,12 @@ IO80211Family Skywalk/WCL path (`IO80211InfraProtocol`), instead of a plain Ethe
 Notes: deployment target must be 15.2 (otherwise `IO80211InterfaceRole` is never published); HAL must emit
 `DRIVER_READY`/`DRIVER_STOPPED`; the interface's own address must follow the ifnet lladdr (private Wi‑Fi address).
 Status: scan, association, WPA2, DHCP and traffic work on MT7921 / Sequoia 15.8.1 (x86_64 Hackintosh).
+
+Fast start / scanning (v1.1):
+- MCU command waits poll the interrupt themselves: `enable`/`disable` run under the command gate on the same workloop
+  as the interrupt handler, so responses used to be processed only after a 3 s timeout (long start, 9 s stop).
+- Firmware deep sleep is disabled right after firmware load (waking it took ~2 s).
+- Scans requested from the Wi-Fi menu are allowed while associated; automatic background scans stay suppressed.
+- A never-rolling `MtkBoot` ioreg property keeps the start-up log of the driver.
+
+Not supported: AirDrop/AWDL (needs a separate awdl0 interface).

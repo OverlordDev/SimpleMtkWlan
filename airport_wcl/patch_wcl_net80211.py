@@ -206,3 +206,147 @@ if "AIRPORT_WCL own addr" not in m:
     assert b in m
     m = m.replace(b, "#ifdef AIRPORT_WCL\n\tmemcpy(dev_req.tlv.omac_addr, sc->sc_ic.ic_myaddr, ETHER_ADDR_LEN);\n#else\n" + b + "#endif\n", 1)
     open(M, "w", encoding="utf-8").write(m)
+
+# --- HAL MtkMwx: быстрый старт/стоп. Причина долгого старта (~30 с): после "KeepFullPwr 0" (deep sleep on) следующая
+# MCU-команда (mac enable) молча теряется -> 3 с таймаут -> mwx_reset -> stop (3 таймаута = 9 с) -> init -> снова таймаут.
+m = open(M, encoding="utf-8").read()
+if "AIRPORT_WCL fast mcu" not in m:
+    # 1) поля: done-флаг ответа и настраиваемый таймаут
+    a = "\t\tuint32_t\t mcu_cmd;\n\t\tuint32_t\t mcu_int;\n\t}\t\t\tsc_mcu_wait[16];\n"
+    assert a in m, "MtkMwx: нет sc_mcu_wait"
+    m = m.replace(a, "\t\tuint32_t\t mcu_cmd;\n\t\tuint32_t\t mcu_int;\n\t\tvolatile int\t mcu_done;\n\t}\t\t\tsc_mcu_wait[16];\n\tint\t\t\tsc_mcu_timeout_ms;\n\tint\t\t\tsc_in_stop;\n", 1)
+    # 2) ответ MCU: done=1 до wakeup
+    a = "\t\tsc->sc_mcu_wait[rxd_seq].mcu_m = m;\n\t\twakeup(&sc->sc_mcu_wait[rxd_seq]);\n"
+    assert a in m
+    m = m.replace(a, "\t\tsc->sc_mcu_wait[rxd_seq].mcu_m = m;\n\t\tsc->sc_mcu_wait[rxd_seq].mcu_done = 1;\n\t\twakeup(&sc->sc_mcu_wait[rxd_seq]);\n", 1)
+    # 3) ожидание: короткими слайсами с проверкой done (нет потерянных wakeup), общий таймаут настраиваемый
+    old = '\trv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait", SEC_TO_NSEC(3));\n\tif (rv != 0) {\n\t\tprintf("%s: command %x timeout\\n", DEVNAME(sc), cmd);\n\t\tmwx_reset(sc);\n\t\treturn rv;\n\t}\n'
+    assert m.count(old) == 2, m.count(old)
+    new = ('\trv = mwx_mcu_sleep_resp(sc, seq); /* AIRPORT_WCL fast mcu */\n\tif (rv != 0) {\n'
+           '\t\tMWX_DEV_LOG(sc, "mcu cmd 0x%x seq=%d timeout (%d ms)\\n", cmd, seq,\n'
+           '\t\t    sc->sc_mcu_timeout_ms ? sc->sc_mcu_timeout_ms : 3000);\n'
+           '\t\tif (!sc->sc_in_stop && (sc->sc_ic.ic_if.if_flags & IFF_RUNNING))\n\t\t\tmwx_reset(sc);\n\t\treturn rv;\n\t}\n')
+    m = m.replace(old, new)
+    helper = '''
+static int
+mwx_mcu_sleep_resp(struct mwx_softc *sc, int seq)
+{
+	int ms = sc->sc_mcu_timeout_ms ? sc->sc_mcu_timeout_ms : 3000;
+	int slept = 0;
+
+	while (!sc->sc_mcu_wait[seq].mcu_done) {
+		if (slept >= ms)
+			return EWOULDBLOCK;
+		tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait", MSEC_TO_NSEC(10));
+		slept += 10;
+	}
+	return 0;
+}
+
+'''
+    i = m.index("\nint\nmwx_mcu_wait_resp_int(struct mwx_softc *sc, uint32_t cmd, int seq,")
+    m = m[:i] + helper + m[i:]
+    # прототип выше первого использования не нужен (helper static перед обеими функциями)
+    # 4) preinit: не включаем deep sleep (не нужен на ПК и ломает следующую команду)
+    a = "\tif ((rv = mwx_mcu_set_deep_sleep(sc, 1)) != 0) {\n\t\tMWX_DEV_LOG(sc, \"preinit deep sleep enable failed error=%d\\n\", rv);\n\t\treturn rv;\n\t}\n"
+    assert a in m
+    m = m.replace(a, "#ifdef AIRPORT_WCL\n\t(void)mwx_mcu_set_deep_sleep(sc, 0); /* FW не засыпает: пробуждение ~2 с ломало старт */\n#else\n" + a + "#endif\n", 1)
+    # 5) stop: не усыпляем и держим короткий таймаут + не запускаем reset из ожиданий
+    a = "\t\tmn = &sc->sc_vif.vif_mn;\n\t\tmt7921_mcu_uni_add_dev(sc, &sc->sc_vif, mn, 0);\n\t\tmwx_mcu_set_deep_sleep(sc, 1);\n\t\tmt7921_mcu_set_mac_enable(sc, 0, 0);\n"
+    assert a in m, "MtkMwx: нет блока stop"
+    b = ("\t\tmn = &sc->sc_vif.vif_mn;\n#ifdef AIRPORT_WCL\n\t\tsc->sc_in_stop = 1;\n"
+         "\t\tmt7921_mcu_uni_add_dev(sc, &sc->sc_vif, mn, 0);\n\t\tmt7921_mcu_set_mac_enable(sc, 0, 0);\n\t\tsc->sc_in_stop = 0;\n#else\n"
+         "\t\tmt7921_mcu_uni_add_dev(sc, &sc->sc_vif, mn, 0);\n\t\tmwx_mcu_set_deep_sleep(sc, 1);\n\t\tmt7921_mcu_set_mac_enable(sc, 0, 0);\n#endif\n")
+    m = m.replace(a, b, 1)
+    # 6) init: короткий таймаут после загрузки FW, пауза после deep sleep off, повтор mac enable
+    a = '\trv = mt7921_mcu_set_mac_enable(sc, 0, 1);\n\tif (rv) {\n\t\tMWX_DEV_LOG(sc, "init mac enable failed error=%d\\n", rv);\n\t\treturn rv;\n\t}\n'
+    assert a in m, "MtkMwx: нет mac enable в init"
+    b = ('#ifdef AIRPORT_WCL\n\tIOSleep(20);\n#endif\n'
+         '\trv = mt7921_mcu_set_mac_enable(sc, 0, 1);\n'
+         '\tif (rv) {\n\t\tMWX_DEV_LOG(sc, "init mac enable failed error=%d\\n", rv);\n\t\treturn rv;\n\t}\n')
+    m = m.replace(a, b, 1)
+    a = '\trv = mwx_mcu_set_deep_sleep(sc, 0);\n\tif (rv)\n\t\tMWX_DEV_LOG(sc, "init disable deep sleep returned %d\\n", rv);\n'
+    assert a in m, "MtkMwx: нет deep sleep в init"
+    m = m.replace(a, "#ifdef AIRPORT_WCL\n\t(void)mwx_mcu_drv_pmctrl(sc);\n#endif\n" + a, 1)
+    # 7) фоновый скан только по запросу WCL (меню Wi-Fi), автоматические остаются подавлены
+    a = "\t{\n\t\tstatic int bgscan_logged;\n"
+    assert a in m, "MtkMwx: нет блока bgscan"
+    m = m.replace(a, "#ifdef AIRPORT_WCL\n\tif (!ic->ic_wcl_scan_requested)\n#endif\n" + a, 1)
+    # активный скан и в фоне, если запросил WCL
+    a = "\t\tif (wcl_active && !bgscan) {\n"
+    assert a in m
+    m = m.replace(a, "\t\tif (wcl_active && (!bgscan || ic->ic_wcl_scan_requested)) {\n", 1)
+    open(M, "w", encoding="utf-8").write(m)
+
+# --- compat.cpp: нерулящийся буфер начала лога (MtkBoot) для разбора времени старта
+C = root + "/mtk80211/compat.cpp"
+c = open(C, encoding="utf-8").read()
+if "mtk_boot" not in c:
+    a = "static IOSimpleLock *mtk_ring_lock;\n"
+    assert a in c
+    c = c.replace(a, "#define MTK_BOOT_SIZE 30000\nstatic char mtk_boot[MTK_BOOT_SIZE];\nstatic UInt32 mtk_boot_len;\nstatic UInt32 mtk_boot_seq;\n" + a, 1)
+    a = "    /* separate rolling buffer for the 1 Hz heartbeat and hardware dumps */\n"
+    assert a in c
+    c = c.replace(a, """    if (!mtk_has(line, " HB ") && !mtk_has(line, " HW ") && !mtk_has(line, "rx process") &&
+        !mtk_has(line, "rx frame delivered") && !mtk_has(line, "DIAGHEX")) {
+        IOInterruptState bs = IOSimpleLockLockDisableInterrupt(mtk_ring_lock);
+        if (mtk_boot_len + n <= MTK_BOOT_SIZE) {
+            memcpy(mtk_boot + mtk_boot_len, line, n);
+            mtk_boot_len += n;
+            mtk_boot_seq++;
+        }
+        IOSimpleLockUnlockEnableInterrupt(mtk_ring_lock, bs);
+    }
+""" + a, 1)
+    a = "    static UInt32 last_seq = (UInt32)-1, last_kseq = (UInt32)-1, last_hseq = (UInt32)-1;\n"
+    assert a in c
+    c = c.replace(a, a + "    static UInt32 last_bseq = (UInt32)-1;\n", 1)
+    a = "    if (mtk_ring_run) {\n        uint64_t dl;\n"
+    assert a in c
+    c = c.replace(a, """    {
+        char *bc = (char *)IOMalloc(MTK_BOOT_SIZE + 1);
+        if (bc && mtk_ring_svc) {
+            UInt32 bl = 0, bs;
+            IOInterruptState st = IOSimpleLockLockDisableInterrupt(mtk_ring_lock);
+            bs = mtk_boot_seq;
+            if (bs != last_bseq) {
+                bl = mtk_boot_len;
+                memcpy(bc, mtk_boot, bl);
+            }
+            IOSimpleLockUnlockEnableInterrupt(mtk_ring_lock, st);
+            if (bs != last_bseq) {
+                bc[bl] = 0;
+                last_bseq = bs;
+                mtk_ring_svc->setProperty("MtkBoot", bc);
+            }
+        }
+        if (bc)
+            IOFree(bc, MTK_BOOT_SIZE + 1);
+    }
+""" + a, 1)
+    open(C, "w", encoding="utf-8").write(c)
+
+# --- HAL MtkMwx: ожидание ответа MCU опрашивает прерывание само. enable/disable выполняются под command gate на workloop,
+# где живёт обработчик прерывания: пока gate занят, ответ не обрабатывается -> каждая команда ждёт полный таймаут (3 с).
+m = open(M, encoding="utf-8").read()
+if "AIRPORT_WCL poll intr" not in m:
+    a = "\tint\t\t\tsc_in_stop;\n"
+    assert a in m
+    m = m.replace(a, a + "\tint\t\t\tsc_intr_busy;\n", 1)
+    # защита от одновременного входа (прерывание + опрос из ожидания)
+    a = "\tstatic uint32_t intr_unhandled_log_count;\n\n\tmwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);\n"
+    assert a in m, "MtkMwx: mwx_intr начало"
+    m = m.replace(a, "\tstatic uint32_t intr_unhandled_log_count;\n\n#ifdef AIRPORT_WCL\n\tif (__sync_lock_test_and_set(&sc->sc_intr_busy, 1))\n\t\treturn 0;\n#endif\n\tmwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);\n", 1)
+    a = "\tif (intr == 0) {\n\t\tmwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);\n\t\treturn 0;\n\t}\n"
+    assert a in m
+    m = m.replace(a, "\tif (intr == 0) {\n\t\tmwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);\n#ifdef AIRPORT_WCL\n\t\t__sync_lock_release(&sc->sc_intr_busy);\n#endif\n\t\treturn 0;\n\t}\n", 1)
+    a = "\tmwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);\n\n\treturn 1;\n}\n"
+    assert m.count(a) == 1, m.count(a)
+    m = m.replace(a, "\tmwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);\n#ifdef AIRPORT_WCL\n\t__sync_lock_release(&sc->sc_intr_busy);\n#endif\n\n\treturn 1;\n}\n", 1)
+    # ожидание: опрос прерывания + короткий sleep
+    a = "\t\ttsleep_nsec(&sc->sc_mcu_wait[seq], 0, \"mwxwait\", MSEC_TO_NSEC(10));\n\t\tslept += 10;\n"
+    assert a in m
+    m = m.replace(a, "\t\t/* AIRPORT_WCL poll intr */\n\t\tmwx_intr(sc);\n\t\tif (sc->sc_mcu_wait[seq].mcu_done)\n\t\t\tbreak;\n\t\ttsleep_nsec(&sc->sc_mcu_wait[seq], 0, \"mwxwait\", MSEC_TO_NSEC(2));\n\t\tslept += 2;\n", 1)
+    # mwx_intr объявлен выше? прототип есть (int mwx_intr(void *)), но принимает void*
+    m = m.replace("mwx_intr(sc);\n\t\tif (sc->sc_mcu_wait[seq].mcu_done)", "mwx_intr((void *)sc);\n\t\tif (sc->sc_mcu_wait[seq].mcu_done)", 1)
+    open(M, "w", encoding="utf-8").write(m)
