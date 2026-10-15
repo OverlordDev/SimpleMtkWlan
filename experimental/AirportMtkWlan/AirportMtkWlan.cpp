@@ -22,14 +22,41 @@ OSDefineMetaClassAndStructors(CTimeout, OSObject)
 IO80211WorkQueue *_fWorkloop;
 IOCommandGate *_fCommandGate;
 
-void AirportMtkWlan::releaseAll()
+/* адреса ядра x86_64 macOS лежат в верхней половине канонического пространства (>= 0xffffff80_00000000) */
+static inline bool mtkLooksLikeKernelPtr(const void *p)
 {
+    return (uint64_t)(uintptr_t)p >= 0xffffff8000000000ULL;
+}
+
+void AirportMtkWlan::releaseCCLogs()
+{
+    /* порядок как в рабочей сборке laobamac/itlwm: сначала потребители pipe-ов (репортёр, потоки, логгер),
+       потом stopPipe() только для реально стартованных pipe-ов, потом сами pipe-ы.
+       Безопасно вызывать повторно и при частично созданных объектах. */
+    OSSafeReleaseNULL(driverFaultReporter);
+    OSSafeReleaseNULL(driverCoreFaultReporter);
+    OSSafeReleaseNULL(driverFaultStream);
+    OSSafeReleaseNULL(driverLogStream);
+    if (driverSnapshotsPipeStarted && driverSnapshotsPipe) {
+        driverSnapshotsPipe->CCPipe::stopPipe();
+        driverSnapshotsPipeStarted = false;
+    }
+    if (driverDataPathPipeStarted && driverDataPathPipe) {
+        driverDataPathPipe->CCPipe::stopPipe();
+        driverDataPathPipeStarted = false;
+    }
+    if (driverLogPipeStarted && driverLogPipe) {
+        driverLogPipe->CCPipe::stopPipe();
+        driverLogPipeStarted = false;
+    }
     OSSafeReleaseNULL(driverLogPipe);
     OSSafeReleaseNULL(driverDataPathPipe);
     OSSafeReleaseNULL(driverSnapshotsPipe);
-    OSSafeReleaseNULL(driverFaultReporter);
-    OSSafeReleaseNULL(driverFaultStream);
-    OSSafeReleaseNULL(driverLogStream);
+}
+
+void AirportMtkWlan::releaseAll()
+{
+    releaseCCLogs();
     if (fHalService) {
         fHalService->release();
         fHalService = NULL;
@@ -146,7 +173,22 @@ initCCLogs()
     driverLogOptions.log_policy = 0;
     driverLogPipe = CCPipe::withOwnerNameCapacity(this, "com.laobamac.AirportMtkWlan", "DriverLogs", &driverLogOptions);
     XYLog("%s driverLogPipeRet %d\n", __FUNCTION__, driverLogPipe != NULL);
-    
+    /* Фабрика withOwnerNameCapacity только инициализирует pipe; event source-ы создаёт startPipe().
+       Квалифицированный вызов CCPipe::startPipe() - как в рабочей сборке laobamac/itlwm (WCL),
+       чтобы не идти через виртуальный слот устаревшего заголовка. Без startPipe() логгер/репортёр
+       Family работают с pipe-ом без источников событий. */
+    if (!driverLogPipe || !getWorkLoop()) {
+        XYLog("%s driverLogPipe %p workloop %p\n", __FUNCTION__, driverLogPipe, getWorkLoop());
+        releaseCCLogs();
+        return false;
+    }
+    driverLogPipeStarted = driverLogPipe->CCPipe::startPipe();
+    XYLog("%s driverLogPipeStarted %d\n", __FUNCTION__, driverLogPipeStarted);
+    if (!driverLogPipeStarted) {
+        releaseCCLogs();
+        return false;
+    }
+
     memset(&driverLogOptions, 0, sizeof(driverLogOptions));
     driverLogOptions.pipe_type = 0;
     driverLogOptions.log_data_type = 0;
@@ -161,7 +203,17 @@ initCCLogs()
     driverLogOptions.log_policy = 0;
     driverDataPathPipe = CCPipe::withOwnerNameCapacity(this, "com.laobamac.AirportMtkWlan", "DatapathEvents", &driverLogOptions);
     XYLog("%s driverDataPathPipeRet %d\n", __FUNCTION__, driverDataPathPipe != NULL);
-    
+    if (!driverDataPathPipe) {
+        releaseCCLogs();
+        return false;
+    }
+    driverDataPathPipeStarted = driverDataPathPipe->CCPipe::startPipe();
+    XYLog("%s driverDataPathPipeStarted %d\n", __FUNCTION__, driverDataPathPipeStarted);
+    if (!driverDataPathPipeStarted) {
+        releaseCCLogs();
+        return false;
+    }
+
     memset(&driverLogOptions, 0, sizeof(driverLogOptions));
     driverLogOptions.pipe_type = 0x200000001;
     driverLogOptions.log_data_type = 2;
@@ -171,28 +223,61 @@ initCCLogs()
     driverLogOptions.pipe_size = 128;
     driverSnapshotsPipe = CCPipe::withOwnerNameCapacity(this, "com.laobamac.AirportMtkWlan", "StateSnapshots", &driverLogOptions);
     XYLog("%s driverSnapshotsPipeRet %d\n", __FUNCTION__, driverSnapshotsPipe != NULL);
-    
-    /* логгер контроллера: Family берёт его через getLogger() в createIOReporters (без него start() падает) */
-    CCStreamOptions logStreamOptions = { 0 };
-    logStreamOptions.stream_type = 0;
-    logStreamOptions.console_level = 0xFFFFFFFFFFFFFFFF;
-    CCStream *logStream = CCStream::withPipeAndName(driverLogPipe, "DriverLogs", &logStreamOptions);
+    if (!driverSnapshotsPipe) {
+        releaseCCLogs();
+        return false;
+    }
+    driverSnapshotsPipeStarted = driverSnapshotsPipe->CCPipe::startPipe();
+    XYLog("%s driverSnapshotsPipeStarted %d\n", __FUNCTION__, driverSnapshotsPipeStarted);
+    if (!driverSnapshotsPipeStarted) {
+        releaseCCLogs();
+        return false;
+    }
+
+    /* логгер контроллера: Family берёт его через getLogger() в createIOReporters (без него start() падает).
+       Параметры потока как в рабочей сборке: пустые CCStreamOptions, имя - любое. */
+    CCStreamOptions logStreamOptions;
+    memset(&logStreamOptions, 0, sizeof(logStreamOptions));
+    CCStream *logStream = CCStream::withPipeAndName(driverLogPipe, "AirportMtkWlan", &logStreamOptions);
     driverLogStream = OSDynamicCast(CCLogStream, logStream);
     if (!driverLogStream && logStream)
         logStream->release();
     XYLog("%s driverLogStream %p (raw %p)\n", __FUNCTION__, driverLogStream, logStream);
+    if (!driverLogStream) {
+        releaseCCLogs();
+        return false;
+    }
 
-    /* репортёр сбоев: CCFaultReporter::withStreamWorkloop(CCDataStream*, IOWorkLoop*), как в драйверах Apple */
-    CCStreamOptions faultReportOptions = { 0 };
+    /* репортёр сбоев. Рабочая сборка делает ТРИ шага, а не один:
+         1) CCStream (stream_type 1) поверх snapshots-pipe  -> CCDataStream
+         2) CCFaultReporter::withStreamWorkloop(dataStream, workloop)
+         3) IO80211FaultReporter::allocWithParams(core)     -> именно он отдаётся из getFaultReporterFromDriver()
+       и проверяет OSDynamicCast(CommonFaultReporter, ...). Раньше здесь отдавался результат шага 2. */
+    CCStreamOptions faultReportOptions;
+    memset(&faultReportOptions, 0, sizeof(faultReportOptions));
     faultReportOptions.stream_type = 1;
     faultReportOptions.console_level = 0xFFFFFFFFFFFFFFFF;
     driverFaultStream = CCStream::withPipeAndName(driverSnapshotsPipe, "FaultReporter", &faultReportOptions);
     CCDataStream *dataStream = driverFaultStream ? OSDynamicCast(CCDataStream, driverFaultStream) : NULL;
     XYLog("%s driverFaultStream %p dataStream %p\n", __FUNCTION__, driverFaultStream, dataStream);
-    if (dataStream)
-        driverFaultReporter = CCFaultReporter::withStreamWorkloop(dataStream, _fWorkloop);
+    if (!dataStream || !_fWorkloop) {
+        releaseCCLogs();
+        return false;
+    }
+    driverCoreFaultReporter = CCFaultReporter::withStreamWorkloop(dataStream, _fWorkloop);
+    XYLog("%s driverCoreFaultReporter %p\n", __FUNCTION__, driverCoreFaultReporter);
+    if (!driverCoreFaultReporter) {
+        releaseCCLogs();
+        return false;
+    }
+    driverFaultReporter = IO80211FaultReporter::allocWithParams(driverCoreFaultReporter);
     XYLog("%s driverFaultReporterRet %p\n", __FUNCTION__, driverFaultReporter);
-    return driverLogPipe && driverDataPathPipe && driverSnapshotsPipe && driverLogStream && driverFaultReporter;
+    if (!driverFaultReporter || !OSDynamicCast(CommonFaultReporter, driverFaultReporter)) {
+        XYLog("%s fault reporter is not a CommonFaultReporter\n", __FUNCTION__);
+        releaseCCLogs();
+        return false;
+    }
+    return true;
 }
 
 extern "C" void mtk_ringlog_start(IOService *svc);
@@ -225,10 +310,11 @@ bool AirportMtkWlan::start(IOService *provider)
     }
     if (!super::start(provider)) {
         XYLog("IO80211Controller::start failed\n");
+        releaseCCLogs();    /* pipe-ы уже стартованы initCCLogs(), stop() для неудавшегося start() не вызовется */
         return false;
     }
     XYLog("start: stage1 super::start OK\n");
-    if (mtkStage == 1) { XYLog("MtkStage 1 reached\n"); super::stop(provider); return false; }
+    if (mtkStage == 1) { XYLog("MtkStage 1 reached\n"); super::stop(provider); releaseCCLogs(); return false; }
     pciNub->setBusMasterEnable(true);
     pciNub->setIOEnable(true);
     pciNub->setMemoryEnable(true);
@@ -331,7 +417,9 @@ bool AirportMtkWlan::start(IOService *provider)
     }
     XYLog("start: stage8 family attachInterface ok\n");
     MTK_STAGE_STOP(5, 1, 1);
-    if (!IONetworkController::attachInterface((IONetworkInterface **)&bsdInterface, true)) {
+    /* false: BSD-интерфейс пока не регистрируем в IORegistry, registerService() - в finishStart() после старта
+       Skywalk-интерфейса (так в рабочей сборке laobamac/itlwm, ветка AIRPORT_WCL). */
+    if (!IONetworkController::attachInterface((IONetworkInterface **)&bsdInterface, false)) {
         XYLog("attach to IONetworkController interface fail\n");
         super::stop(provider);
         releaseAll();
@@ -346,15 +434,55 @@ bool AirportMtkWlan::start(IOService *provider)
         releaseAll();
         return false;
     }
+    /* Ключевое исправление. start() Skywalk-интерфейса читает fRegistrationInfo из ExpansionData, а
+       initRegistrationInfo() заполняет только локальную структуру. Рабочая Sequoia-сборка
+       (laobamac/itlwm AirportItlwmV2.cpp, ветка AIRPORT_WCL) копирует её в оба ExpansionData вручную.
+       Смещения полей 0xb8/0x108 см. IOSkywalkNetworkInterface.h / IOSkywalkEthernetInterface.h. */
+    IOSkywalkNetworkInterface::ExpansionData *expNet = fNetIf->mExpansionData;
+    IOSkywalkEthernetInterface::ExpansionData *expEth = fNetIf->mExpansionData2;
+    XYLog("start: mExpansionData=%p mExpansionData2=%p pre-reg=%p/%p\n", expNet, expEth,
+          expNet ? expNet->fRegistrationInfo : NULL, expEth ? expEth->fRegistrationInfo : NULL);
+    /* защита: указатель обязан быть адресом ядра; иначе смещение не совпало с этой версией Family -
+       лучше остановиться с понятным логом, чем получить панику внутри Apple-кода */
+    if (!mtkLooksLikeKernelPtr(expNet) || !mtkLooksLikeKernelPtr(expEth)) {
+        XYLog("start: ExpansionData pointers are not kernel addresses - ABI offset mismatch, abort\n");
+        super::stop(provider);
+        releaseAll();
+        return false;
+    }
+    expNet->fRegistrationInfo = (IOSkywalkNetworkInterface::RegistrationInfo *)IOMalloc(sizeof(IOSkywalkNetworkInterface::RegistrationInfo));
+    expEth->fRegistrationInfo = (IOSkywalkEthernetInterface::RegistrationInfo *)IOMalloc(sizeof(IOSkywalkEthernetInterface::RegistrationInfo));
+    if (!expNet->fRegistrationInfo || !expEth->fRegistrationInfo) {
+        XYLog("start: IOMalloc for RegistrationInfo failed\n");
+        super::stop(provider);
+        releaseAll();
+        return false;
+    }
+    memcpy(expNet->fRegistrationInfo, &registInfo, sizeof(registInfo));
+    memcpy(expEth->fRegistrationInfo, &registInfo, sizeof(registInfo));
+    XYLog("start: stage10a registration info installed\n");
     if (fNetIf->getInterfaceRole() == 1)
         fNetIf->deferBSDAttach(true);
     XYLog("start: stage10 before iface start\n");
     MTK_STAGE_STOP(7, 1, 1);
-    /* Запуск интерфейса Family роняет ядро на самой ранней стадии загрузки (журнал паники не успевает сохраниться).
-       Откладываем fNetIf->start() на MtkDelaySec секунд (по умолчанию 90), когда система и диск уже живы:
-       если упадёт, останется .panic с бектрейсом. */
+    /* MtkDelaySec (ключ Info.plist):
+         0   - fNetIf->start() синхронно, как в рабочей сборке; при неудаче start() возвращает false;
+         >0  - отложенный старт через thread_call (отладочный режим: если ядро упадёт, к этому моменту диск уже
+               жив и останется .panic с бектрейсом). По умолчанию 90, как было до этой правки. */
     OSNumber *delayProp = OSDynamicCast(OSNumber, getProperty("MtkDelaySec"));
     unsigned int delaySec = delayProp ? delayProp->unsigned32BitValue() : 90;
+    if (delaySec == 0) {
+        XYLog("start: stage11 synchronous fNetIf->start()\n");
+        if (!fNetIf->start(this)) {
+            XYLog("start: fNetIf->start() failed\n");
+            super::stop(provider);
+            releaseAll();
+            return false;
+        }
+        XYLog("start: stage12 iface start OK\n");
+        finishStart();
+        return true;
+    }
     ifStartCall = thread_call_allocate(ifStartTrampoline, (thread_call_param_t)this);
     if (!ifStartCall) {
         XYLog("thread_call_allocate failed\n");
@@ -382,11 +510,24 @@ void AirportMtkWlan::delayedInterfaceStart()
     XYLog("delayed: fNetIf->start() begin\n");
     bool ok = fNetIf->start(this);
     XYLog("delayed: fNetIf->start() returned %d\n", ok);
+    if (!ok) {
+        /* раньше здесь всё равно вызывался registerService(); при неудаче старта интерфейса его не регистрируем */
+        XYLog("delayed: interface start failed, controller is not registered\n");
+        return;
+    }
+    finishStart();
+    XYLog("delayed: registerService done\n");
+}
+
+void AirportMtkWlan::finishStart()
+{
     setLinkStatus(kIONetworkLinkValid);
     if (TAILQ_EMPTY(&fHalService->get80211Controller()->ic_ess))
         fHalService->get80211Controller()->ic_flags |= IEEE80211_F_AUTO_JOIN;
+    /* BSD-интерфейс присоединён с doRegister=false, регистрируем его здесь, потом сам контроллер */
+    if (bsdInterface)
+        bsdInterface->registerService();
     registerService();
-    XYLog("delayed: registerService done\n");
 }
 
 void AirportMtkWlan::stop(IOService *provider)
@@ -438,6 +579,11 @@ bool AirportMtkWlan::createWorkQueue()
 }
 
 IO80211WorkQueue *AirportMtkWlan::getWorkQueue() const
+{
+    return _fWorkloop;
+}
+
+IOWorkLoop *AirportMtkWlan::getWorkLoop() const
 {
     return _fWorkloop;
 }

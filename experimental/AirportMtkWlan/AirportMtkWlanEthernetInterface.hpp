@@ -47,6 +47,7 @@ public:
     virtual IOService * getProvider( void ) const override;
     
 private:
+    static IOReturn prepareBSDGated(OSObject *, void *, void *, void *, void *);
     IO80211SkywalkInterface *interface;
     bool isAttach;
 };

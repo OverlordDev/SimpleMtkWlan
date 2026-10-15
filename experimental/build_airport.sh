@@ -8,6 +8,9 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
+# статическая проверка порядка start() и раскладки ABI (см. check_airport_start.py); обходить не нужно,
+# она не требует ничего кроме python3 и отрабатывает за долю секунды
+python3 -I "$HERE/check_airport_start.py" "$REPO" || { echo "check_airport_start.py: правила нарушены, сборка остановлена"; exit 1; }
 SEQ="$REPO/sequoia_build"
 TGZ="$(mktemp -d)/source_stageB_vht80.tgz"
 tar czf "$TGZ" -C "$REPO" SimpleMtkWlan mtk80211 include SimpleMtkWlan.xcodeproj

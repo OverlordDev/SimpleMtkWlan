@@ -277,7 +277,24 @@ initWithController(IOService *provider)
         return false;
     this->fHalService = instance->fHalService;
     this->scanSource = instance->scanSource;
-    return ret;
+    /* Вторая инициализация. Рабочая Sequoia-сборка (laobamac/itlwm AirportItlwmSkywalkInterface::init) после
+       IO80211InfraInterface::init() вызывает ещё и виртуальный IO80211SkywalkInterface::init(provider, mac)
+       (слот 412), передавая постоянный MAC адаптера. Без неё Family остаётся без провайдера и MAC.
+       MAC к этому моменту известен: fHalService->attach() выполняется в start() раньше. */
+    IOEthernetAddress address;
+    memset(&address, 0, sizeof(address));
+    if (instance->getHardwareAddress(&address) != kIOReturnSuccess) {
+        XYLog("%s getHardwareAddress failed, MAC is not known yet\n", __PRETTY_FUNCTION__);
+        return false;
+    }
+    XYLog("%s MAC %02x:%02x:%02x:%02x:%02x:%02x\n", __PRETTY_FUNCTION__,
+          address.bytes[0], address.bytes[1], address.bytes[2],
+          address.bytes[3], address.bytes[4], address.bytes[5]);
+    if (!IO80211SkywalkInterface::init(provider, reinterpret_cast<ether_addr *>(&address))) {
+        XYLog("%s IO80211SkywalkInterface::init(provider, mac) failed\n", __PRETTY_FUNCTION__);
+        return false;
+    }
+    return true;
 }
 
 //ifnet_t AirportMtkWlanSkywalkInterface::

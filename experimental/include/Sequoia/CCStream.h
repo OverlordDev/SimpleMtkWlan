@@ -53,4 +53,19 @@ public:
     static CCFaultReporter *withStreamWorkloop(CCDataStream *, IOWorkLoop *);
 };
 
+/* Sequoia 15.x: Family через getFaultReporterFromDriver() ждёт НЕ CCFaultReporter, а обёртку IO80211FaultReporter
+   (CommonFaultReporter). Рабочая сборка laobamac/itlwm (include/Airport/macOS15/FaultReporter.h):
+       core = CCFaultReporter::withStreamWorkloop(dataStream, workloop);
+       rep  = IO80211FaultReporter::allocWithParams(core);   // проверить OSDynamicCast(CommonFaultReporter, rep)
+   Классы живут в ядре (IO80211Family); здесь только объявления. */
+class CommonFaultReporter : public OSObject {
+    OSDeclareAbstractStructors(CommonFaultReporter)
+};
+
+class IO80211FaultReporter : public CommonFaultReporter {
+    OSDeclareDefaultStructors(IO80211FaultReporter)
+public:
+    static IO80211FaultReporter *allocWithParams(CCFaultReporter *);
+};
+
 #endif /* CCStream_h */

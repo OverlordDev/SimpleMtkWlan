@@ -15,8 +15,16 @@ public:
 public:
     bool initRegistrationInfo(IOSkywalkEthernetInterface::RegistrationInfo*, unsigned int, unsigned long);
     bool registerEthernetInterface(IOSkywalkEthernetInterface::RegistrationInfo const*, IOSkywalkPacketQueue**, unsigned int, IOSkywalkPacketBufferPool*, IOSkywalkPacketBufferPool*, unsigned int);
-protected:
-    uint8_t _abi_pad_IOSkywalkEthernetInterface[0x110 - sizeof(IOSkywalkNetworkInterface)];
+    /* Ethernet-часть данных регистрации (см. IOSkywalkNetworkInterface.h). Смещение 0x108 - из
+       laobamac/itlwm include/Airport/macOS15/IOSkywalkEthernetInterface.h (static_assert там же). */
+    struct ExpansionData {
+        RegistrationInfo *fRegistrationInfo;
+        void *fBSDInterface;
+    };
+    uint8_t _layout0[0x38];             /* 0xd0 .. 0x108 */
+    ExpansionData *mExpansionData2;     /* 0x108 */
 };
+static_assert(sizeof(IOSkywalkEthernetInterface::RegistrationInfo) == 0x130, "RegistrationInfo size");
 static_assert(sizeof(IOSkywalkEthernetInterface) == 0x110, "IOSkywalkEthernetInterface size");
+static_assert(__offsetof(IOSkywalkEthernetInterface, mExpansionData2) == 0x108, "IOSkywalkEthernetInterface::mExpansionData2 offset");
 #endif

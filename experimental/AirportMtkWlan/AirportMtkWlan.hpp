@@ -105,6 +105,9 @@ public:
     void disableAdapter(IONetworkInterface *netif);
     bool initCCLogs();
     
+    /* Sequoia: рабочая сборка (laobamac/itlwm AirportItlwmV2.cpp) переопределяет и getWorkLoop(),
+       возвращая очередь wrapper-а; иначе Family берёт собственный workloop, а не тот, на котором висит command gate. */
+    virtual IOWorkLoop *getWorkLoop() const override;
     virtual IO80211WorkQueue *getWorkQueue() const override;
     virtual bool requiresExplicitMBufRelease() override {
         return false;
@@ -251,7 +254,16 @@ public:
     
     CCLogStream *driverLogStream;
     CCStream *driverFaultStream;
-    CCFaultReporter *driverFaultReporter;
+    CCFaultReporter *driverCoreFaultReporter;     /* CCFaultReporter::withStreamWorkloop */
+    IO80211FaultReporter *driverFaultReporter;    /* обёртка, её отдаёт getFaultReporterFromDriver() */
+
+    /* pipe-ы надо стартовать (CCPipe::startPipe) и останавливать только если старт удался */
+    bool driverLogPipeStarted;
+    bool driverDataPathPipeStarted;
+    bool driverSnapshotsPipeStarted;
+
+    void finishStart();     /* общий хвост start(): link status, auto-join, registerService() */
+    void releaseCCLogs();   /* CC-логгеры/репортёр/pipe-ы: stopPipe() только для стартованных, затем release */
 };
 
 #endif /* AirportMtkWlan_hpp */
