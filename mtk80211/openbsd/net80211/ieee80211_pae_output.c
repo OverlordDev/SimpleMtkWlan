@@ -79,6 +79,10 @@ mbuf_t 	ieee80211_get_eapol_key(int, int, u_int);
  * Send an EAPOL-Key frame to node `ni'.  If MIC or encryption is required,
  * the PTK must be passed (otherwise it can be set to NULL.)
  */
+void mtk_diag_hex(const char *tag, const u_int8_t *p, int len);
+extern int mtk_msg2_bits;
+extern int mtk_msg2_active;
+
 int
 ieee80211_send_eapol_key(struct ieee80211com *ic, mbuf_t m,
                          struct ieee80211_node *ni, const struct ieee80211_ptk *ptk)
@@ -105,6 +109,12 @@ ieee80211_send_eapol_key(struct ieee80211com *ic, mbuf_t m,
     key->desc = (ni->ni_rsnprotos == IEEE80211_PROTO_RSN) ?
     EAPOL_KEY_DESC_IEEE80211 : EAPOL_KEY_DESC_WPA;
     
+    if (mtk_msg2_active) {
+        if (mtk_msg2_bits & 1)
+            key->version = 2;
+        if (mtk_msg2_bits & 2)
+            BE_WRITE_2(key->keylen, 16);
+    }
     info = BE_READ_2(key->info);
     /* use V3 descriptor if KDF is SHA256-based */
     if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms))
@@ -140,6 +150,12 @@ ieee80211_send_eapol_key(struct ieee80211com *ic, mbuf_t m,
 #endif
     if (info & EAPOL_KEY_KEYMIC)
         ieee80211_eapol_key_mic(key, ptk->kck);
+    mtk_diag_hex("TXEAPOL", (const u_int8_t *)key, len);
+    XYLog("DIAG eapol tx: info=%04x desc=%d len=%d keylen_field=%d paylen=%d mbuf_len=%zu pkthdr_len=%zu next=%p mic=%02x%02x%02x%02x kck=%02x%02x%02x%02x\n",
+          BE_READ_2(key->info), key->desc, len, BE_READ_2(key->len), BE_READ_2(key->paylen),
+          (size_t)mbuf_len(m), (size_t)mbuf_pkthdr_len(m), mbuf_next(m),
+          key->mic[0], key->mic[1], key->mic[2], key->mic[3],
+          ptk->kck[0], ptk->kck[1], ptk->kck[2], ptk->kck[3]);
     
 #ifndef IEEE80211_STA_ONLY
     /* start a 100ms timeout if an answer is expected from supplicant */

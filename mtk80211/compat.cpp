@@ -201,6 +201,7 @@ int bus_dmamap_create(bus_dma_tag_t tag, bus_size_t size, int nsegments, bus_siz
 	*dmamp = new bus_dmamap;
 	memset(*dmamp, 0, sizeof(**dmamp));
 	(*dmamp)->dm_maxsize = size;
+	(*dmamp)->dm_maxsegs = nsegments;
 	(*dmamp)->cursor = IOMbufNaturalMemoryCursor::withSpecification(maxsegsz, nsegments);
 	if ((*dmamp)->cursor == 0)
 		return 1;
@@ -377,7 +378,22 @@ int bus_dmamap_load(bus_dmamap_t map, mbuf_t mb) {
 		return 1;
 	map->dm_mapsize = (bus_size_t)pktlen;
 	bool needs_bounce = false;
-	for (int i = 0; i < map->dm_nsegs; i++) {
+	/*
+	 * The device descriptors only have room for dm_maxsegs buffers
+	 * (4 in the TX descriptor). Chains with more physical segments
+	 * overflowed the descriptor and corrupted the neighbouring TX
+	 * descriptors, hanging the DMA engine under load. Linearise those
+	 * through the bounce buffer instead.
+	 */
+	if (map->dm_maxsegs > 0 && map->dm_nsegs > map->dm_maxsegs) {
+		static uint32_t seg_log_count;
+		if (seg_log_count < 16 || (seg_log_count % 1024) == 0)
+			mtk_ringlog("dmaseg overflow nsegs=%d max=%d len=%zu -> bounce\n",
+			    map->dm_nsegs, map->dm_maxsegs, pktlen);
+		seg_log_count++;
+		needs_bounce = true;
+	}
+	for (int i = 0; i < map->dm_nsegs && !needs_bounce; i++) {
 		if (segs[i].location > UINT32_MAX || segs[i].length > UINT32_MAX) {
 			needs_bounce = true;
 			break;
@@ -494,4 +510,206 @@ void bus_dmamap_unload(bus_dma_tag_t tag, bus_dmamap_t map) {
 	map->dm_bounce = false;
 	map->dm_nsegs = 0;
 	map->dm_mapsize = 0;
+}
+
+/*
+ * Debug ring buffer. Kernel printf from this kext does not reach the unified
+ * log on recent macOS, so lines are also kept here and published to the
+ * IORegistry property "MtkLog" (read with: ioreg -w0 -rn SimpleMtkWlan).
+ */
+#include <IOKit/IOService.h>
+#include <libkern/libkern.h>
+#include <kern/clock.h>
+#include <kern/thread_call.h>
+
+#define MTK_RING_SIZE 40000
+static char mtk_ring[MTK_RING_SIZE];
+static UInt32 mtk_ring_len;
+static UInt32 mtk_ring_seq;
+#define MTK_HB_SIZE 30000
+static char mtk_hb[MTK_HB_SIZE];
+static UInt32 mtk_hb_len;
+static UInt32 mtk_hb_seq;
+#define MTK_KEEP_SIZE 28000
+static char mtk_keep[MTK_KEEP_SIZE];
+static UInt32 mtk_keep_len;
+static UInt32 mtk_keep_seq;
+static IOSimpleLock *mtk_ring_lock;
+static thread_call_t mtk_ring_call;
+static IOService *mtk_ring_svc;
+static bool mtk_ring_run;
+
+static bool mtk_has(const char *h, const char *n)
+{
+    size_t nl = strlen(n);
+    for (; *h; h++)
+        if (strncmp(h, n, nl) == 0)
+            return true;
+    return false;
+}
+
+extern "C" void mtk_ringlog(const char *fmt, ...)
+{
+    char line[600];
+    va_list ap;
+    int n;
+    clock_sec_t sec;
+    clock_usec_t usec;
+
+    if (!mtk_ring_lock)
+        return;
+    /* drop high-volume per-frame/scan chatter so the ring keeps the interesting part */
+    if (fmt && (mtk_has(fmt, "txwi") || mtk_has(fmt, "tx desc") || mtk_has(fmt, "tx free event") ||
+        mtk_has(fmt, "TXS wcid") || mtk_has(fmt, "tx frame wcid") || mtk_has(fmt, "scan request") ||
+        mtk_has(fmt, "mcu tx cmd") || mtk_has(fmt, "newstate task 1 -> 1")))
+        return;
+    clock_get_calendar_microtime(&sec, &usec);
+    n = snprintf(line, sizeof(line), "[%u.%03u] ", (unsigned)(sec % 100000), (unsigned)(usec / 1000));
+    va_start(ap, fmt);
+    n += vsnprintf(line + n, sizeof(line) - n, fmt, ap);
+    va_end(ap);
+    if (n >= (int)sizeof(line))
+        n = sizeof(line) - 1;
+    if (n > 0 && line[n - 1] != '\n') {
+        if (n < (int)sizeof(line) - 1)
+            line[n++] = '\n';
+        else
+            line[n - 1] = '\n';
+    }
+
+    /* separate rolling buffer for the 1 Hz heartbeat and hardware dumps */
+    if (mtk_has(line, " HB ") || mtk_has(line, " HW ")) {
+        IOInterruptState hs = IOSimpleLockLockDisableInterrupt(mtk_ring_lock);
+        if (mtk_hb_len + n > MTK_HB_SIZE) {
+            UInt32 drop = mtk_hb_len + n - MTK_HB_SIZE;
+            if (drop > mtk_hb_len)
+                drop = mtk_hb_len;
+            memmove(mtk_hb, mtk_hb + drop, mtk_hb_len - drop);
+            mtk_hb_len -= drop;
+        }
+        memcpy(mtk_hb + mtk_hb_len, line, n);
+        mtk_hb_len += n;
+        mtk_hb_seq++;
+        IOSimpleLockUnlockEnableInterrupt(mtk_ring_lock, hs);
+        return;
+    }
+
+    /* never-rolling buffer for one-off dumps (assoc req, beacons, mgmt frames) */
+    if (mtk_has(line, " TXASSOCREQ ") || mtk_has(line, " RXMGT ") || mtk_has(line, " APRSNIE ") ||
+        mtk_has(line, " BCNDUMP ") || mtk_has(line, " VARIANT ") || mtk_has(line, " CAND ") || mtk_has(line, " UTXD ") ||
+        mtk_has(line, "key add done") || mtk_has(line, "key add complete")) {
+        IOInterruptState ks = IOSimpleLockLockDisableInterrupt(mtk_ring_lock);
+        if (mtk_keep_len + n <= MTK_KEEP_SIZE) {
+            memcpy(mtk_keep + mtk_keep_len, line, n);
+            mtk_keep_len += n;
+            mtk_keep_seq++;
+        }
+        IOSimpleLockUnlockEnableInterrupt(mtk_ring_lock, ks);
+        return;
+    }
+
+    IOInterruptState st = IOSimpleLockLockDisableInterrupt(mtk_ring_lock);
+    if (mtk_ring_len + n > MTK_RING_SIZE) {
+        UInt32 drop = mtk_ring_len + n - MTK_RING_SIZE;
+        if (drop > mtk_ring_len)
+            drop = mtk_ring_len;
+        memmove(mtk_ring, mtk_ring + drop, mtk_ring_len - drop);
+        mtk_ring_len -= drop;
+    }
+    memcpy(mtk_ring + mtk_ring_len, line, n);
+    mtk_ring_len += n;
+    mtk_ring_seq++;
+    IOSimpleLockUnlockEnableInterrupt(mtk_ring_lock, st);
+}
+
+static void mtk_ring_publish(thread_call_param_t, thread_call_param_t)
+{
+    static UInt32 last_seq = (UInt32)-1, last_kseq = (UInt32)-1, last_hseq = (UInt32)-1;
+    char *copy = (char *)IOMalloc(MTK_RING_SIZE + 1);
+    if (copy && mtk_ring_svc) {
+        UInt32 len = 0, seq;
+        IOInterruptState st = IOSimpleLockLockDisableInterrupt(mtk_ring_lock);
+        seq = mtk_ring_seq;
+        if (seq != last_seq) {
+            len = mtk_ring_len;
+            memcpy(copy, mtk_ring, len);
+        }
+        IOSimpleLockUnlockEnableInterrupt(mtk_ring_lock, st);
+        if (seq != last_seq) {
+            copy[len] = 0;
+            last_seq = seq;
+            mtk_ring_svc->setProperty("MtkLog", copy);
+        }
+    }
+    if (copy)
+        IOFree(copy, MTK_RING_SIZE + 1);
+    {
+        char *kc = (char *)IOMalloc(MTK_KEEP_SIZE + 1);
+        if (kc && mtk_ring_svc) {
+            UInt32 kl = 0, ks;
+            IOInterruptState st = IOSimpleLockLockDisableInterrupt(mtk_ring_lock);
+            ks = mtk_keep_seq;
+            if (ks != last_kseq) {
+                kl = mtk_keep_len;
+                memcpy(kc, mtk_keep, kl);
+            }
+            IOSimpleLockUnlockEnableInterrupt(mtk_ring_lock, st);
+            if (ks != last_kseq) {
+                kc[kl] = 0;
+                last_kseq = ks;
+                mtk_ring_svc->setProperty("MtkKeep", kc);
+            }
+        }
+        if (kc)
+            IOFree(kc, MTK_KEEP_SIZE + 1);
+    }
+    {
+        char *hc = (char *)IOMalloc(MTK_HB_SIZE + 1);
+        if (hc && mtk_ring_svc) {
+            UInt32 hl = 0, hs;
+            IOInterruptState st = IOSimpleLockLockDisableInterrupt(mtk_ring_lock);
+            hs = mtk_hb_seq;
+            if (hs != last_hseq) {
+                hl = mtk_hb_len;
+                memcpy(hc, mtk_hb, hl);
+            }
+            IOSimpleLockUnlockEnableInterrupt(mtk_ring_lock, st);
+            if (hs != last_hseq) {
+                hc[hl] = 0;
+                last_hseq = hs;
+                mtk_ring_svc->setProperty("MtkHB", hc);
+            }
+        }
+        if (hc)
+            IOFree(hc, MTK_HB_SIZE + 1);
+    }
+    if (mtk_ring_run) {
+        uint64_t dl;
+        clock_interval_to_deadline(500, kMillisecondScale, &dl);
+        thread_call_enter_delayed(mtk_ring_call, dl);
+    }
+}
+
+extern "C" void mtk_ringlog_start(IOService *svc)
+{
+    if (mtk_ring_call)
+        return;
+    mtk_ring_lock = IOSimpleLockAlloc();
+    mtk_ring_svc = svc;
+    mtk_ring_run = true;
+    mtk_ring_call = thread_call_allocate(mtk_ring_publish, NULL);
+    mtk_ringlog("ringlog started\n");
+    if (mtk_ring_call)
+        thread_call_enter(mtk_ring_call);
+}
+
+extern "C" void mtk_ringlog_stop(void)
+{
+    mtk_ring_run = false;
+    if (mtk_ring_call) {
+        thread_call_cancel_wait(mtk_ring_call);
+        thread_call_free(mtk_ring_call);
+        mtk_ring_call = NULL;
+    }
+    mtk_ring_svc = NULL;
 }

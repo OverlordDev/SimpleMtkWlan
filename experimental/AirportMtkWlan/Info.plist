@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>AirportMtkWlan</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.laobamac.AirportMtkWlan</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>AirportMtkWlan</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>NetworkController</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.laobamac.AirportMtkWlan</string>
+			<key>IOClass</key>
+			<string>AirportMtkWlan</string>
+			<key>IOMatchCategory</key>
+			<string>WiFiDriver</string>
+			<key>IONetworkRootType</key>
+			<string>airport</string>
+			<key>IOProbeScore</key>
+			<integer>70000</integer>
+			<key>IOProviderClass</key>
+			<string>IOPCIEDeviceWrapper</string>
+			<key>IOResourceMatch</key>
+			<string>IOBSD</string>
+		</dict>
+		<key>mtkwlan</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.laobamac.AirportMtkWlan</string>
+			<key>IOClass</key>
+			<string>IOPCIEDeviceWrapper</string>
+			<key>IOPCIMatch</key>
+			<string>0x796114c3 0x060814c3 0x792214c3</string>
+			<key>IOProbeScore</key>
+			<integer>70000</integer>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+		</dict>
+	</dict>
+	<key>NSHumanReadableCopyright</key>
+	<string>Based on AirportItlwm (c) 2020 zxystd, GPL-2.0. MT792x support: laobamac and contributors.</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.driver.corecapture</key>
+		<string>1.0.0</string>
+		<key>com.apple.iokit.IO80211Family</key>
+		<string>1.5.0</string>
+		<key>com.apple.iokit.IONetworkingFamily</key>
+		<string>3.2</string>
+		<key>com.apple.iokit.IOPCIFamily</key>
+		<string>2.9</string>
+		<key>com.apple.iokit.IOSkywalkFamily</key>
+		<string>1.0</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>16.7</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>16.7</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>16.7</string>
+		<key>com.apple.kpi.mach</key>
+		<string>16.7</string>
+	</dict>
+</dict>
+</plist>
