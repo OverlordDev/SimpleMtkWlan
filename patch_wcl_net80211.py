@@ -535,3 +535,89 @@ MtkMwx::setMacAddress(const uint8_t *addr)
 
 """ + a, 1)
     open(M, "w", encoding="utf-8").write(m)
+
+# --- Честное время (build "timing"): delay() с микросекундами, mwx_poll/ожидания по реальным часам.
+# Раньше delay(10) = IOSleep(1), а mwx_poll делал timeout*100 итераций -> таймауты были в ~100 раз длиннее номинала,
+# а ожидания MCU считали итерации, а не время. Номинальные таймауты ниже подняты там, где карта в "плохом" состоянии
+# реально отвечает по 10-14 с (driver own, загрузка прошивки).
+m = open(M, encoding="utf-8").read()
+if "mwx_now_ms" not in m:
+    import re as _re
+    # 1) delay()
+    a = "static inline void delay(int usec) { IOSleep((usec + 999) / 1000); }\n"
+    assert m.count(a) == 1
+    m = m.replace(a, "#ifdef AIRPORT_WCL\nstatic inline void delay(int usec)\n{\n\tif (usec <= 0)\n\t\treturn;\n\tif (usec < 1000)\n\t\tIODelay(usec);\n\telse\n\t\tIOSleep((usec + 999) / 1000);\n}\n#else\n" + a + "#endif\n", 1)
+    # 2) часы и gMwxAbort раньше mwx_poll: они объявлены у gMwxHal
+    a = "static volatile int gMwxAbort; /* выключение/остановка: прервать долгие ожидания карты */\n#endif\n"
+    assert m.count(a) == 1
+    m = m.replace(a, "static volatile int gMwxAbort; /* выключение/остановка: прервать долгие ожидания карты */\n"
+        "static inline uint64_t mwx_now_ms(void)\n{\n\tuint64_t abs_t, ns;\n\n\tclock_get_uptime(&abs_t);\n\tabsolutetime_to_nanoseconds(abs_t, &ns);\n\treturn ns / 1000000ULL;\n}\n#endif\n", 1)
+    # 3) mwx_poll по реальному времени
+    old = _re.search(r"int\nmwx_poll\(struct mwx_softc \*sc, uint32_t reg, uint32_t val, uint32_t mask,\n    int timeout\)\n\{.*?\n\treturn ETIMEDOUT;\n\}\n", m, _re.S)
+    assert old, "mwx_poll не найден"
+    new = '''int
+mwx_poll(struct mwx_softc *sc, uint32_t reg, uint32_t val, uint32_t mask,
+    int timeout)
+{
+	uint32_t cur;
+#ifdef AIRPORT_WCL
+	uint64_t start = mwx_now_ms();
+	int spins = 0;
+
+	/* timeout - миллисекунды реального времени */
+	reg = mwx_reg_addr(sc, reg);
+	for (;;) {
+		cur = bus_space_read_4(sc->sc_st, sc->sc_memh, reg) & mask;
+		if (cur == val)
+			return 0;
+		if (gMwxAbort)
+			return ETIMEDOUT;
+		if (mwx_now_ms() - start >= (uint64_t)timeout)
+			break;
+		if (spins++ < 200)
+			IODelay(10);
+		else
+			IOSleep(1);
+	}
+	DPRINTF("%s: poll timeout reg %x val %x mask %x cur %x\\n",
+	    DEVNAME(sc), reg, val, mask, cur);
+	return ETIMEDOUT;
+#else
+''' + old.group(0)[old.group(0).index("\n{\n")+3:].replace("\tuint32_t cur;\n\n","",1).rsplit("}\n",1)[0] + '''#endif
+}
+'''
+    m = m[:old.start()] + new + m[old.end():]
+    # 4) номинальные таймауты опросов (мс реального времени)
+    def sub(pat, repl):
+        global m
+        r = _re.subn(pat, repl, m, count=1, flags=_re.S)
+        assert r[1] == 1, pat
+        m = r[0]
+    sub(r"(MT_WFDMA0_GLO_CFG_TX_DMA_BUSY \| MT_WFDMA0_GLO_CFG_RX_DMA_BUSY, )100\)", r"\g<1>500)")
+    sub(r"(PCIE_LPCR_HOST_OWN_SYNC,\n\t\t    4, )50\)", r"\g<1>500)")
+    sub(r"(MT_CONN_ON_LPCTL, 0,\n\t\t    PCIE_LPCR_HOST_OWN_SYNC, )50\)", r"\g<1>2000)")
+    sub(r"(WFSYS_SW_INIT_DONE,\n\t    WFSYS_SW_INIT_DONE, )500\)", r"\g<1>2000)")
+    sub(r"(MT_TOP_LPCR_HOST_FW_OWN,\n\t    )5000\)", r"\g<1>20000)")
+    sub(r"(MT_TOP_MISC2_FW_N9_RDY,\n\t    MT_TOP_MISC2_FW_N9_RDY, )1500\)", r"\g<1>15000)")
+    # 5) ожидания MCU и TX-очереди по реальному времени
+    a = "\tint ms = sc->sc_mcu_timeout_ms ? sc->sc_mcu_timeout_ms : 3000;\n\tint slept = 0;\n"
+    assert m.count(a) == 1
+    m = m.replace(a, "\tint ms = sc->sc_mcu_timeout_ms ? sc->sc_mcu_timeout_ms : 10000;\n\tuint64_t t_start = mwx_now_ms();\n", 1)
+    a = "\t\tif (slept >= ms || gMwxAbort)\n\t\t\treturn EWOULDBLOCK;\n"
+    assert m.count(a) == 1
+    m = m.replace(a, "\t\tif ((int)(mwx_now_ms() - t_start) >= ms || gMwxAbort)\n\t\t\treturn EWOULDBLOCK;\n", 1)
+    a = "\t\ttsleep_nsec(&sc->sc_mcu_wait[seq], 0, \"mwxwait\", MSEC_TO_NSEC(2));\n\t\tslept += 2;\n"
+    assert m.count(a) == 1
+    m = m.replace(a, "\t\ttsleep_nsec(&sc->sc_mcu_wait[seq], 0, \"mwxwait\", MSEC_TO_NSEC(2));\n", 1)
+    m = m.replace("sc->sc_mcu_timeout_ms ? sc->sc_mcu_timeout_ms : 3000);", "sc->sc_mcu_timeout_ms ? sc->sc_mcu_timeout_ms : 10000);")
+    m = m.replace("\t\tsc->sc_mcu_timeout_ms = 3000;\n", "\t\tsc->sc_mcu_timeout_ms = 10000;\n")
+    a = "\t\tint qwait = 0; /* AIRPORT_WCL txq poll */\n"
+    assert m.count(a) == 1
+    m = m.replace(a, "\t\tuint64_t q_start = mwx_now_ms(); /* AIRPORT_WCL txq poll */\n", 1)
+    a = "\t\t\tif (++qwait > 1500 || gMwxAbort) {\n"
+    assert m.count(a) == 1
+    m = m.replace(a, "\t\t\tif ((mwx_now_ms() - q_start) > 10000 || gMwxAbort) {\n", 1)
+    if "<kern/clock.h>" not in m:
+        first = m.index("#include")
+        m = m[:first] + "#ifdef AIRPORT_WCL\n#include <kern/clock.h>\n#endif\n" + m[first:]
+    open(M, "w", encoding="utf-8").write(m)
