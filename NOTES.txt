@@ -1,0 +1,38 @@
+AirportMtkWlan: порт обвязки AirportItlwm (системное Wi-Fi через IO80211Family) на драйвер MT7921.
+Старт: 2026-10-10.
+
+Референс: reference_itlwm/  (git clone --depth 1 OpenIntelWireless/itlwm, коммит 53c51c2, GPL-2.0, последний пуш 2024-07)
+Цель: Sequoia 15.8.1, IO80211Family 1200.13.1 (проверено: com.apple.iokit.IO80211Family в BootKernelExtensions.kc).
+
+Что выяснено
+  - net80211 у нас (mtk80211) почти идентичен upstream itl80211: 8-37 различающихся строк на файл, в основном шапки.
+  - HAL (MtkHalService/MtkDriverInfo/MtkDriverController) по форме совпадает с ItlHalService/ItlDriverInfo/ItlDriverController.
+  - Сборка AirportItlwm-Sonoma14.4: флаги AIRPORT, IO80211FAMILY_V2, __IO80211_TARGET=__MAC_14_4, __PRIVATE_SPI__.
+    Источники Airport: AirportItlwmV2.cpp, AirportItlwmSkywalkInterface.cpp, AirportItlwmEthernetInterface.cpp,
+    AirportSTAIOCTL.cpp, AirportVirtualIOCTL.cpp, AirportAWDL.cpp, IOPCIEDeviceWrapper.cpp (+ include/Airport/*.h).
+  - Info.plist: два personality: IOClass=IOPCIEDeviceWrapper (nub по PCI ID) и NetworkController (IOClass=AirportItlwm,
+    IOProviderClass=IOPCIEDeviceWrapper, IOMatchCategory=WiFiDriver, IONetworkRootType=airport);
+    OSBundleLibraries: IO80211Family, IOSkywalkFamily, corecapture, IONetworkingFamily, IOPCIFamily.
+  - Релиз 2.3.0 (2024-06): сборки только до Sonoma 14.4+, Sequoia отдельно нет. iServices с AirportItlwm ограничены.
+
+План
+  1. Каркас сборки (clang, как sequoia_build/build.sh): Airport-исходники + наш MtkMwx + mtk80211, bundle id com.laobamac.AirportMtkWlan.
+  2. Адаптация: ItlHal* -> MtkHal*, probe/PCI ID MT7921/MT7922, предохранитель (boot-arg/ключ), свои имена классов.
+  3. Первая проверка на железе только с отключённым SimpleMtkWlan (оба матчатся на одно устройство).
+
+2026-10-10 (поздно): итог проверки совместимости с Sequoia 15.8.1
+  Собранный AirportMtkWlan.kext линкуется, но 35 символов из 920 не резолвятся в ядре Sequoia, а главное - порядок
+  виртуальных методов в заголовках референса (Sonoma 14.4) не совпадает с реальным в Sequoia (см. sequoia_abi/README.txt).
+  Референса под Sequoia нет (upstream остановился на 14.4). Для живого порта нужно:
+   1) сгенерировать заголовки IO80211Controller/IO80211SkywalkInterface/IOSkywalk*Interface из vtable Sequoia (скрипт есть),
+   2) выровнять размеры классов (instance size из метакласса) и сами обработчики: в Sequoia ioctl идёт через
+      handleCardSpecific + типизированные get*/set* (см. vtables_AppleBCMWLANCore), а не apple80211_ioctl_get/set,
+   3) портировать STA-ioctl (AirportSTAIOCTL.cpp) - в текущей сборке его ещё нет,
+   4) отладка вслепую на железе: каждая ошибка = паника + перезагрузка с флешки.
+  Установка на флешку НЕ делалась, config.plist не трогался. Рабочий SimpleMtkWlan остаётся как есть.
+
+2026-10-10 (ночь): bring-up сборка
+  include/Sequoia/ (сгенерировано из vtable), sequoia_abi/gen_headers.py, check_vtable.py (clang vtable == ядро, слот в слот).
+  build_airport.sh -> out/AirportMtkWlan-diag.kext, 0 нерезолвленных символов. На железе ещё не запускалось.
+  Интерфейс: AirportMtkWlanSkywalkInterface : IO80211InfraProtocol; слоты, которые не реализованы - заглушки с логом MTKSTUB.
+  Установка на флешку: install_airport_to_stick.sh (подменяет содержимое SimpleMtkWlan.kext, config.plist не трогает; restore).

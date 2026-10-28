@@ -1,0 +1,12 @@
+    virtual bool isCommandProhibited(int) APPLE_KEXT_OVERRIDE;
+    virtual SInt32 handleCardSpecific(IO80211SkywalkInterface*, unsigned long, void*, bool) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn getDRIVER_VERSION(IO80211SkywalkInterface*, apple80211_version_data*) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn getHARDWARE_VERSION(IO80211SkywalkInterface*, apple80211_version_data*) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn getCARD_CAPABILITIES(IO80211SkywalkInterface*, apple80211_capability_data*) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn getPOWER(IO80211SkywalkInterface*, apple80211_power_data*) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn setPOWER(IO80211SkywalkInterface*, apple80211_power_data*) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn getCOUNTRY_CODE(IO80211SkywalkInterface*, apple80211_country_code_data*) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn setCOUNTRY_CODE(IO80211SkywalkInterface*, apple80211_country_code_data*) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn setGET_DEBUG_INFO(IO80211SkywalkInterface*, apple80211_debug_command*) APPLE_KEXT_OVERRIDE;
+    virtual void * getLogger() const APPLE_KEXT_OVERRIDE;
+    virtual void * getFaultReporterFromDriver() APPLE_KEXT_OVERRIDE;

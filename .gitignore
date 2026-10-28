@@ -1,0 +1,11 @@
+build/
+build_wcl/
+out_*/
+out/
+reference_*/
+sequoia_abi/
+t/scan
+t/*.o
+mtklog_now.txt
+*.pyc
+__pycache__/
