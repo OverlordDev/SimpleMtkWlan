@@ -621,3 +621,48 @@ mwx_poll(struct mwx_softc *sc, uint32_t reg, uint32_t val, uint32_t mask,
         first = m.index("#include")
         m = m[:first] + "#ifdef AIRPORT_WCL\n#include <kern/clock.h>\n#endif\n" + m[first:]
     open(M, "w", encoding="utf-8").write(m)
+
+# --- Надёжная переинициализация железа (чинит "выкл/вкл Wi-Fi убивает карту"):
+# после WFSYS reset бит FW_N9_RDY (CONN_ON домен) может остаться взведённым от прошлого запуска -> mwx_load_firmware
+# считает прошивку "уже загруженной", а её RAM пуста, NIC capability -> EINVAL. Ждём сброса бита, при необходимости
+# делаем второй reset; и повторяем всю инициализацию несколько раз вместо отказа с первой ошибки.
+m = open(M, encoding="utf-8").read()
+if "FW N9_RDY stale" not in m:
+    a = '\tMWX_DEV_LOG(sc, "hardware init dma reset ok\\n");\n'
+    assert m.count(a) == 1
+    m = m.replace(a, a + '''#ifdef AIRPORT_WCL
+	if (mwx_read(sc, MT_CONN_ON_MISC) & MT_TOP_MISC2_FW_N9_RDY) {
+		MWX_DEV_LOG(sc, "FW N9_RDY still set after WFSYS reset, waiting\\n");
+		if (mwx_poll(sc, MT_CONN_ON_MISC, 0, MT_TOP_MISC2_FW_N9_RDY, 500) != 0) {
+			MWX_DEV_LOG(sc, "FW N9_RDY stale, second WFSYS reset\\n");
+			(void)mwx_dma_reset(sc, 1);
+			(void)mwx_poll(sc, MT_CONN_ON_MISC, 0, MT_TOP_MISC2_FW_N9_RDY, 500);
+		}
+	}
+#endif
+''', 1)
+    old = '''		(void)mwx_dma_reset(sc, 1); /* первый WFSYS reset после работы не сбрасывает прошивку (patch sem=3) */
+		rv = mwx_init_hardware(sc);
+		if (rv) {
+			MWX_DEV_LOG(sc, "init hardware re-init failed error=%d\\n", rv);
+			return rv;
+		}
+'''
+    assert old in m, "re-init блок"
+    new = '''		{
+			int try_n;
+
+			for (try_n = 0; try_n < 4; try_n++) {
+				rv = mwx_init_hardware(sc);
+				if (rv == 0 || gMwxAbort)
+					break;
+				MWX_DEV_LOG(sc, "init hardware re-init try %d failed error=%d\\n", try_n, rv);
+			}
+		}
+		if (rv) {
+			MWX_DEV_LOG(sc, "init hardware re-init failed error=%d\\n", rv);
+			return rv;
+		}
+'''
+    m = m.replace(old, new, 1)
+    open(M, "w", encoding="utf-8").write(m)
