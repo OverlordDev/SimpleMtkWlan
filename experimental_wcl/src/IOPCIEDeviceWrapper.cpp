@@ -49,6 +49,7 @@ static void pciMsiXClearAndSet(IOPCIDevice *device, UInt8 msixCap, UInt16 clear,
 }
 
 extern IOWorkLoop *_fWorkloop;
+extern "C" void mtk_ringlog(const char *fmt, ...);
 
 IOWorkLoop *IOPCIEDeviceWrapper::getWorkLoop() const
 {
@@ -72,6 +73,14 @@ probe(IOService *provider, SInt32 *score)
     }
     if (isMatch) {
         XYLog("%s Found\n", __FUNCTION__);
+        /* Карта могла остаться живой от прошлой загрузки (тёплый ресет): прошивка продолжает DMA по старым кольцам
+         * и слать MSI в память нового ядра. Гасим bus master и INTx до самого подъёма (bringupRun включит обратно). */
+        {
+            UInt16 cmd = device->configRead16(kIOPCIConfigCommand);
+            if (cmd != 0xffff)
+                device->configWrite16(kIOPCIConfigCommand, (cmd & ~kIOPCICommandBusMaster) | 0x0400);
+            mtk_ringlog("probe: card quiesced cmd 0x%04x -> 0x%04x\n", cmd, device->configRead16(kIOPCIConfigCommand));
+        }
         device->findPCICapability(PCI_CAP_ID_MSIX, &msixCap);
         if (msixCap)
             pciMsiXClearAndSet(device, msixCap, PCI_MSIX_FLAGS_ENABLE, 0);

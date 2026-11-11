@@ -280,6 +280,9 @@ bool AirportMtkWlan::start(IOService *provider)
 #if __IO80211_TARGET == __MAC_15_2
     if (version_major != 24 || version_minor < 2)
         return false;
+#elif __IO80211_TARGET == __MAC_26_0
+    if (version_major != 25) // Tahoe = Darwin 25; сборка под Sequoia (Darwin 24) в другом кексте
+        return false;
 #endif
     XYLog("%s\n", __PRETTY_FUNCTION__);
     struct IOSkywalkEthernetInterface::RegistrationInfo registInfo;
@@ -302,7 +305,8 @@ bool AirportMtkWlan::start(IOService *provider)
         return false;
     }
     mtk_ringlog("start: super::start done\n");
-    pciNub->setBusMasterEnable(true);
+    // bus master остаётся выключенным до bringupRun(): живая карта с прошлой загрузки не должна писать в память
+    pciNub->setBusMasterEnable(false);
     pciNub->setIOEnable(true);
     pciNub->setMemoryEnable(true);
     pciNub->configWrite8(0x41, 0);
@@ -375,6 +379,9 @@ bool AirportMtkWlan::start(IOService *provider)
         return false;
     }
     bringupState = 1;
+    bringupGpuReleased = false;
+    bringupPolls = 0;
+    clock_get_uptime(&bringupT0);
     scheduleBringup(30000); // карта поднимается уже после загрузки рабочего стола, а не во время старта GPU/PCI
     return true;
 }
@@ -397,16 +404,71 @@ void AirportMtkWlan::scheduleBringup(uint32_t ms)
         release(); // уже стоял в очереди: лишнюю ссылку не держим
 }
 
+// NVIDIA-драйвер (NVRM) поднимает дисплей на ~55-80 с после старта ядра и держит реестр занятым; подъём карты в это же окно
+// (DMA-кольца, прошивка, MSI, PCI-обращения) мешает ему и даёт "display PARTIAL" -> перезагрузка охранником. Ждём "display armed".
+// boot-arg mtkwlan_gpuwait=N (секунды, по умолчанию 180, 0 = не ждать). Без NVRM в системе просто ждём N секунд.
+bool AirportMtkWlan::gpuSettled()
+{
+    int maxWait = 180;
+    PE_parse_boot_argn("mtkwlan_gpuwait", &maxWait, sizeof(maxWait));
+    if (maxWait <= 0)
+        return true;
+    uint64_t now = 0, ns = 0;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now - bringupT0, &ns);
+    uint32_t sec = (uint32_t)(ns / 1000000000ULL);
+    char hold[40] = "";
+    bool armed = false;
+    OSDictionary *match = IOService::serviceMatching("NVRM");
+    IOService *nv = match ? IOService::copyMatchingService(match) : NULL;
+    if (match)
+        match->release();
+    if (nv) {
+        OSObject *prop = nv->copyProperty("nvrm-boot-hold", gIOServicePlane,
+                                          kIORegistryIterateRecursively | kIORegistryIterateParents);
+        OSString *str = OSDynamicCast(OSString, prop);
+        if (str) {
+            strlcpy(hold, str->getCStringNoCopy(), sizeof(hold));
+            armed = str->isEqualTo("display armed");
+        }
+        if (prop)
+            prop->release();
+        nv->release();
+    }
+    if (armed) {
+        mtk_ringlog("bringup: GPU display armed after %u s, starting card\n", sec);
+        return true;
+    }
+    if (sec >= (uint32_t)maxWait) {
+        mtk_ringlog("bringup: GPU wait timeout %u s (hold='%s'), starting card\n", sec, hold);
+        return true;
+    }
+    if ((bringupPolls++ % 10) == 0)
+        mtk_ringlog("bringup: waiting for GPU display (hold='%s', %u s of %d)\n", hold, sec, maxWait);
+    return false;
+}
+
 void AirportMtkWlan::bringupRun()
 {
     if (bringupStopping)
         return;
+    if (!bringupGpuReleased) {
+        if (!gpuSettled()) {
+            scheduleBringup(2000);
+            return;
+        }
+        bringupGpuReleased = true;
+    }
     bringupState = 2;
     int attempt = ++bringupAttempt;
     int failn = 0; // отладка: boot-arg mtkwlan_failn=N имитирует N провалов подряд
     bool injected = PE_parse_boot_argn("mtkwlan_failn", &failn, sizeof(failn)) && attempt <= failn;
     mtk_ringlog("bringup: attempt %d%s\n", attempt, injected ? " (injected failure)" : "");
     bool ok = !injected && fHalService;
+    if (ok && !halAttached && !prepareCard()) {
+        ok = false;
+        mtk_ringlog("bringup: card not ready, will retry\n");
+    }
     if (ok && !halAttached) {
         mtk_ringlog("bringup: hal attach\n");
         if (fHalService->attach(pciNub)) {
@@ -450,6 +512,40 @@ void AirportMtkWlan::bringupRun()
     mtk_ringlog("bringup: attempt %d failed, retry in %u ms\n", attempt, delays[attempt - 1]);
     bringupState = 1;
     scheduleBringup(delays[attempt - 1]);
+}
+
+// Проверка карты ДО первого MMIO-обращения: config space читается безопасно даже у мёртвого устройства, а MMIO нет.
+bool AirportMtkWlan::prepareCard()
+{
+    if (!pciNub)
+        return false;
+    UInt16 vid = pciNub->configRead16(kIOPCIConfigVendorID);
+    if (vid != 0x14c3) {
+        mtk_ringlog("bringup: config space vendor=0x%04x (card gone or in reset), MMIO skipped\n", vid);
+        return false;
+    }
+    UInt16 cmd = pciNub->configRead16(kIOPCIConfigCommand);
+    cmd |= kIOPCICommandMemorySpace | kIOPCICommandBusMaster;
+    cmd &= ~(kIOPCICommandIOSpace | 0x0400);
+    pciNub->configWrite16(kIOPCIConfigCommand, cmd);
+    mtk_ringlog("bringup: card prepared cmd=0x%04x\n", pciNub->configRead16(kIOPCIConfigCommand));
+    return true;
+}
+
+// Выключение/перезагрузка: оставляем карту «чистой» для следующей загрузки (без живых DMA и прерываний).
+void AirportMtkWlan::systemWillShutdown(IOOptionBits specifier)
+{
+    mtk_ringlog("systemWillShutdown spec=0x%x state=%d\n", (unsigned)specifier, (int)bringupState);
+    bringupStopping = true; // отложенный подъём больше не стартует
+    if (bringupCall)
+        thread_call_cancel(bringupCall);
+    if (halAttached && fHalService)
+        fHalService->quiesceHardware();
+    if (pciNub) {
+        pciNub->setBusMasterEnable(false); // и карта перестаёт писать в память, и MSI не доставляются
+        mtk_ringlog("systemWillShutdown: card quiesced\n");
+    }
+    super::systemWillShutdown(specifier);
 }
 
 bool AirportMtkWlan::completeStart()
@@ -1337,11 +1433,11 @@ bool AirportMtkWlan::initPCIPowerManagment(IOPCIDevice *provider)
 
     reg16 = provider->configRead16(kIOPCIConfigCommand);
 
-    reg16 |= ( kIOPCICommandBusMaster       |
-               kIOPCICommandMemorySpace     |
+    reg16 |= ( kIOPCICommandMemorySpace     |
                kIOPCICommandMemWrInvalidate );
 
     reg16 &= ~kIOPCICommandIOSpace;  // disable I/O space
+    reg16 &= ~kIOPCICommandBusMaster; // включается в bringupRun() непосредственно перед первым обращением к карте
 
     provider->configWrite16( kIOPCIConfigCommand, reg16 );
     provider->findPCICapability(kIOPCIPowerManagementCapability,

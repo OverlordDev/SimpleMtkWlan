@@ -666,3 +666,278 @@ if "FW N9_RDY stale" not in m:
 '''
     m = m.replace(old, new, 1)
     open(M, "w", encoding="utf-8").write(m)
+
+# --- Карта «в чистом состоянии» при выключении/перезагрузке: гасим прерывания и DMA, делаем WFSYS reset, отдаём управление прошивке.
+# Иначе после тёплой перезагрузки живая прошивка продолжает DMA по старым кольцам в память нового ядра (зависание ~+30 с после старта драйвера).
+H2 = root + "/include/HAL/MtkHalService.hpp"
+h = open(H2, encoding="utf-8").read()
+if "quiesceHardware" not in h:
+    a = "    virtual void abortFirmware() {}\n"
+    assert h.count(a) == 1
+    h = h.replace(a, a + "    virtual void quiesceHardware() {}\n", 1)
+    open(H2, "w", encoding="utf-8").write(h)
+HP = root + "/SimpleMtkWlan/hal_mwx/MtkMwx.hpp"
+hp = open(HP, encoding="utf-8").read()
+if "quiesceHardware" not in hp:
+    a = "    void abortFirmware() override;\n"
+    assert hp.count(a) == 1
+    hp = hp.replace(a, a + "    void quiesceHardware() override;\n", 1)
+    open(HP, "w", encoding="utf-8").write(hp)
+m = open(M, encoding="utf-8").read()
+if "MtkMwx::quiesceHardware" not in m:
+    a = "void\nMtkMwx::abortFirmware()\n{\n\tgMwxAbort = 1;\n}\n"
+    assert m.count(a) == 1
+    m = m.replace(a, a + '''
+void
+MtkMwx::quiesceHardware()
+{
+	struct mwx_softc *sc = com;
+	int i;
+
+	if (sc == NULL || sc->sc_memh == 0)
+		return;
+	if (mwx_read(sc, MT_WFDMA0_GLO_CFG) == 0xffffffffU) {
+		MWX_DEV_LOG(sc, "quiesce: device not responding, skipped\\n");
+		return;
+	}
+	MWX_DEV_LOG(sc, "quiesce: begin\\n");
+	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
+	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0);
+	mwx_clear(sc, MT_WFDMA0_GLO_CFG,
+	    MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN |
+	    MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN);
+	for (i = 0; i < 200; i++) { /* до 20 мс, без mwx_poll (он зависит от gMwxAbort) */
+		if (!(mwx_read(sc, MT_WFDMA0_GLO_CFG) &
+		    (MT_WFDMA0_GLO_CFG_TX_DMA_BUSY | MT_WFDMA0_GLO_CFG_RX_DMA_BUSY)))
+			break;
+		IODelay(100);
+	}
+	/* WFSYS reset: та же последовательность, что в attach, прошивка не переживёт выключение */
+	mwx_clear(sc, MT_WFSYS_SW_RST_B, WFSYS_SW_RST_B);
+	IODelay(50000);
+	mwx_set(sc, MT_WFSYS_SW_RST_B, WFSYS_SW_RST_B);
+	for (i = 0; i < 300; i++) { /* до 300 мс */
+		if ((mwx_read(sc, MT_WFSYS_SW_RST_B) & WFSYS_SW_INIT_DONE) == WFSYS_SW_INIT_DONE)
+			break;
+		IODelay(1000);
+	}
+	mwx_write(sc, MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_SET_OWN);
+	MWX_DEV_LOG(sc, "quiesce: done reset_wait=%dms\\n", i);
+}
+''', 1)
+    open(M, "w", encoding="utf-8").write(m)
+
+# --- TX: кольцо передачи освобождается только по прерыванию TX_DONE, а mwx_start гонит пачки по 32 кадра -> кольцо (256) заполняется
+# раньше, чем прибрано, и ~8% кадров при отдаче теряются (счётчик enqerr), TCP сбрасывает окно. Перед постановкой в кольцо забираем
+# уже отправленные дескрипторы и при нехватке места ждём до ~1 мс вместо потери кадра.
+m = open(M, encoding="utf-8").read()
+if "mwx_tx_ring_reclaim" not in m:
+    a = "int\nmwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)\n{"
+    assert m.count(a) == 1, m.count(a)
+    m = m.replace(a, '''#ifdef AIRPORT_WCL
+static inline int	mwx_dma_free_slots(struct mwx_queue *);
+static void
+mwx_tx_ring_reclaim(struct mwx_softc *sc)
+{
+	struct mwx_queue *q = &sc->sc_txq;
+	int spin;
+
+	if (mwx_dma_free_slots(q) >= 8)
+		return;
+	for (spin = 0; spin < 50; spin++) {
+		mwx_dma_tx_cleanup(sc, q);
+		if (mwx_dma_free_slots(q) >= 8)
+			return;
+		IODelay(20);
+	}
+}
+#endif
+
+''' + a, 1)
+    b = "\trv = mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);\n\tif (rv != 0) {\n\t\t/* ring full: txwi_put() unloads the map and frees the mbuf */"
+    assert m.count(b) == 1, m.count(b)
+    m = m.replace(b, "#ifdef AIRPORT_WCL\n\tmwx_tx_ring_reclaim(sc);\n#endif\n" + b, 1)
+    open(M, "w", encoding="utf-8").write(m)
+
+# --- Профилировщик приёма: раз в секунду строка "HB prof ..." (микросекунды за секунду: всего в rx_done, выемка из кольца, пополнение кольца,
+# обработка кадров net80211, передача в систему if_input). Нужен, чтобы увидеть, куда уходит время при загрузке, без root/dtrace.
+m = open(M, encoding="utf-8").read()
+if "g_pf_total" not in m:
+    a = "static uint32_t g_tx_enq, g_tx_nobuf, g_tx_enq_err, g_txfree, g_txs_n, g_txs_err;\n"
+    assert m.count(a) == 1
+    m = m.replace(a, a + '''#ifdef AIRPORT_WCL
+static uint64_t g_pf_total, g_pf_deq, g_pf_fill, g_pf_proc, g_pf_ifin;
+static uint32_t g_pf_calls;
+static inline uint64_t mwx_pns(void)
+{
+	uint64_t abs_t, ns;
+
+	clock_get_uptime(&abs_t);
+	absolutetime_to_nanoseconds(abs_t, &ns);
+	return ns;
+}
+#endif
+''', 1)
+    old = '''	mwx_dma_rx_dequeue(sc, q, &ml);
+
+	if (ml_empty(&ml) && !q->mq_fill_pending)
+		return;
+
+	/* a failed refill is retried from here and from mwx_intr() */
+	mwx_queue_fill(sc, q);
+
+	if (ml_empty(&ml))
+		return;
+
+	mwx_dma_rx_process(sc, &ml);
+}
+'''
+    assert m.count(old) == 1, m.count(old)
+    new = '''#ifdef AIRPORT_WCL
+	uint64_t t0 = mwx_pns(), t1, t2, t3;
+
+	mwx_dma_rx_dequeue(sc, q, &ml);
+	t1 = mwx_pns();
+
+	if (ml_empty(&ml) && !q->mq_fill_pending)
+		return;
+
+	/* a failed refill is retried from here and from mwx_intr() */
+	mwx_queue_fill(sc, q);
+	t2 = mwx_pns();
+
+	if (!ml_empty(&ml))
+		mwx_dma_rx_process(sc, &ml);
+	t3 = mwx_pns();
+	g_pf_deq += t1 - t0;
+	g_pf_fill += t2 - t1;
+	g_pf_proc += t3 - t2;
+	g_pf_total += t3 - t0;
+	g_pf_calls++;
+}
+#else
+''' + old.replace("{\n", "{\n", 1) + "#endif\n"
+    # old содержит тело без заголовка функции: заменяем только тело
+    m = m.replace(old, new, 1)
+    b = "\tif_input(&sc->sc_ic.ic_if, &mlout);\n}\n"
+    assert m.count(b) == 1, m.count(b)
+    m = m.replace(b, '''#ifdef AIRPORT_WCL
+	{
+		uint64_t ti = mwx_pns();
+
+		if_input(&sc->sc_ic.ic_if, &mlout);
+		g_pf_ifin += mwx_pns() - ti;
+	}
+#else
+	if_input(&sc->sc_ic.ic_if, &mlout);
+#endif
+}
+''', 1)
+    c = "\t\t\t    g_txwi_inuse, wsc->sc_txq.mq_prod, wsc->sc_txq.mq_cons);\n"
+    assert m.count(c) == 1, m.count(c)
+    m = m.replace(c, c + '''#ifdef AIRPORT_WCL
+		{
+			static uint64_t l_total, l_deq, l_fill, l_proc, l_ifin;
+			static uint32_t l_calls;
+
+			if (g_pf_calls != l_calls)
+				MWX_DEV_LOG(wsc, "HB prof calls=%u total=%uus deq=%uus fill=%uus proc=%uus (of it if_input=%uus)\\n",
+				    g_pf_calls - l_calls, (uint32_t)((g_pf_total - l_total) / 1000),
+				    (uint32_t)((g_pf_deq - l_deq) / 1000), (uint32_t)((g_pf_fill - l_fill) / 1000),
+				    (uint32_t)((g_pf_proc - l_proc) / 1000), (uint32_t)((g_pf_ifin - l_ifin) / 1000));
+			l_total = g_pf_total; l_deq = g_pf_deq; l_fill = g_pf_fill;
+			l_proc = g_pf_proc; l_ifin = g_pf_ifin; l_calls = g_pf_calls;
+		}
+#endif
+''', 1)
+    open(M, "w", encoding="utf-8").write(m)
+
+# --- Профилировщик выемки из кольца приёма (подробно): синхронизация буфера, освобождение отображения, чтение индекса карты, кольцо.
+m = open(M, encoding="utf-8").read()
+if "g_pf_d_sync" not in m:
+    a = "static uint32_t g_pf_calls;\n"
+    assert m.count(a) == 1
+    m = m.replace(a, a + "static uint64_t g_pf_d_sync, g_pf_d_unload, g_pf_d_read, g_pf_d_ring;\nstatic uint32_t g_pf_d_frames, g_pf_d_reads;\n", 1)
+    b = '''		bus_dmamap_sync(sc->sc_dmat, md->md_map, 0,
+		    md->md_map->dm_mapsize, BUS_DMASYNC_POSTREAD);
+		bus_dmamap_unload(sc->sc_dmat, md->md_map);
+'''
+    assert m.count(b) == 1, m.count(b)
+    m = m.replace(b, '''#ifdef AIRPORT_WCL
+		{
+			uint64_t ta = mwx_pns(), tb, tc;
+
+			bus_dmamap_sync(sc->sc_dmat, md->md_map, 0,
+			    md->md_map->dm_mapsize, BUS_DMASYNC_POSTREAD);
+			tb = mwx_pns();
+			bus_dmamap_unload(sc->sc_dmat, md->md_map);
+			tc = mwx_pns();
+			g_pf_d_sync += tb - ta;
+			g_pf_d_unload += tc - tb;
+			g_pf_d_frames++;
+		}
+#else
+''' + b + "#endif\n", 1)
+    c = '''		/* XXX should we actually do that? */
+		if (idx == last)
+			last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
+	}
+
+	/* XXX make sure we don't have half processed data */
+'''
+    assert m.count(c) == 1, m.count(c)
+    m = m.replace(c, '''		/* XXX should we actually do that? */
+#ifdef AIRPORT_WCL
+		if (idx == last) {
+			uint64_t tr = mwx_pns();
+
+			last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
+			g_pf_d_read += mwx_pns() - tr;
+			g_pf_d_reads++;
+		}
+	}
+#else
+''' + c + "#endif\n", 1)
+    d = "\tbus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,\n\t     BUS_DMASYNC_PREREAD);\n\n\twhile (idx != last) {"
+    assert m.count(d) == 1, m.count(d)
+    m = m.replace(d, '''#ifdef AIRPORT_WCL
+	{
+		uint64_t tq = mwx_pns();
+
+		bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
+		     BUS_DMASYNC_PREREAD);
+		g_pf_d_ring += mwx_pns() - tq;
+	}
+#else
+	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
+	     BUS_DMASYNC_PREREAD);
+#endif
+
+	while (idx != last) {''', 1)
+    e = "\t\t\tl_proc = g_pf_proc; l_ifin = g_pf_ifin; l_calls = g_pf_calls;\n"
+    assert m.count(e) == 1
+    m = m.replace(e, '''			{
+				static uint64_t l_ds, l_du, l_dr, l_dq;
+				static uint32_t l_df, l_dn;
+
+				if (g_pf_d_frames != l_df)
+					MWX_DEV_LOG(wsc, "HB prof2 frames=%u sync=%uus unload=%uus idxread=%uus (reads=%u) ringsync=%uus\\n",
+					    g_pf_d_frames - l_df, (uint32_t)((g_pf_d_sync - l_ds) / 1000),
+					    (uint32_t)((g_pf_d_unload - l_du) / 1000), (uint32_t)((g_pf_d_read - l_dr) / 1000),
+					    g_pf_d_reads - l_dn, (uint32_t)((g_pf_d_ring - l_dq) / 1000));
+				l_ds = g_pf_d_sync; l_du = g_pf_d_unload; l_dr = g_pf_d_read; l_dq = g_pf_d_ring;
+				l_df = g_pf_d_frames; l_dn = g_pf_d_reads;
+			}
+''' + e, 1)
+    open(M, "w", encoding="utf-8").write(m)
+
+# --- Скорость: буфер копирования (bounce) для кадров в памяти выше 4 ГБ выделялся как kIOMapInhibitCache (некэшируемая память).
+# bus_dmamap_sync(POSTREAD) читает из него каждый принятый кадр побайтно: ~270 мкс на кадр (потолок ~3,6 тыс. кадров/с = ~40 Мбит/с).
+# Для буфера данных кэшируемая память подходит (PCIe на x86 когерентен); кольца дескрипторов остаются некэшируемыми.
+CP = root + "/mtk80211/compat.cpp"
+c = open(CP, encoding="utf-8").read()
+if "kIOMemoryPhysicallyContiguous);" not in c.split("bounce_size, PAGE_SIZE")[1][:60] if "bounce_size, PAGE_SIZE" in c else True:
+    old = "alloc_dma_memory(bounce_size, PAGE_SIZE);"
+    assert c.count(old) == 1, c.count(old)
+    c = c.replace(old, "alloc_dma_memory(bounce_size, PAGE_SIZE, kIOMemoryPhysicallyContiguous); /* кэшируемая: чтение из UC ~270 мкс на кадр */", 1)
+    open(CP, "w", encoding="utf-8").write(c)

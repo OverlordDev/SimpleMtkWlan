@@ -9,3 +9,6 @@ t/*.o
 mtklog_now.txt
 *.pyc
 __pycache__/
+build_tahoe/
+mtklogs/
+release/

@@ -80,6 +80,7 @@ public:
     virtual IOService* probe(IOService* provider, SInt32* score) override;
     virtual bool start(IOService *provider) override;
     virtual void stop(IOService *provider) override;
+    virtual void systemWillShutdown(IOOptionBits specifier) override;
     virtual IOReturn enable(IO80211SkywalkInterface *netif) AIRPORT_LEGACY_OVERRIDE;
     virtual IOReturn disable(IO80211SkywalkInterface *netif) AIRPORT_LEGACY_OVERRIDE;
     virtual IOReturn setHardwareAddress(const void *addr, UInt32 addrBytes) override;
@@ -159,6 +160,8 @@ public:
     // отложенный подъём карты: система грузится независимо от состояния железа
     static void bringupEntry(thread_call_param_t p0, thread_call_param_t p1);
     void bringupRun();
+    bool prepareCard();
+    bool gpuSettled();
     void scheduleBringup(uint32_t ms);
     bool completeStart();
     bool isReady() const { return bringupState == 3; }
@@ -260,6 +263,9 @@ public:
     thread_call_t bringupCall;
     volatile int bringupState; // 0 нет, 1 ждёт, 2 работает, 3 готово, 4 сдались
     volatile bool bringupStopping;
+    bool bringupGpuReleased;
+    int bringupPolls;
+    uint64_t bringupT0;
     int bringupAttempt;
     bool halAttached;
     thread_call_t powerOffThreadCall;

@@ -36,3 +36,16 @@ AirportMtkWlan: порт обвязки AirportItlwm (системное Wi-Fi �
   build_airport.sh -> out/AirportMtkWlan-diag.kext, 0 нерезолвленных символов. На железе ещё не запускалось.
   Интерфейс: AirportMtkWlanSkywalkInterface : IO80211InfraProtocol; слоты, которые не реализованы - заглушки с логом MTKSTUB.
   Установка на флешку: install_airport_to_stick.sh (подменяет содержимое SimpleMtkWlan.kext, config.plist не трогает; restore).
+
+2026-11-06: подготовка к macOS 26 Tahoe (сверка со статикой, на железе не запускалось)
+  Эталон: Tahoe 26.7.2 (25G332), BootKernelExtensions.kc + ядро, взяты с тома установщика. IO80211Family там тоже 1200.13.1.
+  sequoia_abi/tahoe/: vtables_Tahoe26.7.2.txt (vtable из ядра), defined_symbols_26.7.2.txt (экспорт KC+ядра для проверки символов).
+  Итоги сверки:
+   - IO80211Controller и IOSkywalkInterface в Tahoe не менялись; IOSkywalkNetworkInterface/Ethernet/IO80211SkywalkInterface/InfraInterface/InfraProtocol сдвинуты
+     (вставка слота 293 и ещё несколько), и те же сдвиги есть в наших заголовках experimental_wcl/include/Airport/macOS26 относительно macOS15.
+   - Размеры классов (из конструктора метакласса в ядре): IOSkywalkInterface 0xb0, NetworkInterface 0xe0, Ethernet 0x120, IO80211SkywalkInterface 0x128,
+     InfraInterface 0x130, Controller 0x128: совпадают со static_assert в macOS26 (в Sequoia: 0xb0/0xd0/0x110/0x118/0x120/0x128, совпадают с macOS15).
+   - Чисто виртуальных слотов у AirportMtkWlan и AirportMtkWlanSkywalkInterface нет; 960 внешних символов кекста есть в Tahoe.
+  Сборка: bash build_airport_tahoe.sh -> out_tahoe/AirportMtkWlan-diag.kext (__IO80211_TARGET=__MAC_26_0; start() отказывает, если Darwin != 25).
+  Установка: install_airport_tahoe_to_stick.sh кладёт кекст отдельной папкой и печатает правки config.plist (MinKernel 25.0.0 / MaxKernel 24.99.99 для Sequoia-кекста).
+  Не проверено: загрузка на самом Tahoe (HE выключен по умолчанию, WPA3-only/AWDL/MLO не поддерживаются, как у референса).
